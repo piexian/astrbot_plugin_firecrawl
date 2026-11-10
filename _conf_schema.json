@@ -1,0 +1,87 @@
+{
+  "api_keys": {
+    "type": "list",
+    "description": "Firecrawl API Key 列表",
+    "hint": "支持多 Key 轮换；加载时自动精确去重；同一 team 的 Key 共享额度与限流，插件不自动识别 team；前往 https://www.firecrawl.dev/ 获取",
+    "default": []
+  },
+  "base_url": {
+    "type": "string",
+    "description": "Firecrawl API Base URL",
+    "hint": "默认官方地址，可填自托管或代理地址，不带 /v2",
+    "default": "https://api.firecrawl.dev"
+  },
+  "timeout_seconds": {
+    "type": "int",
+    "description": "单次请求超时（秒）",
+    "default": 60
+  },
+  "key_cooldown_seconds": {
+    "type": "int",
+    "description": "失败 Key 冷却时长（秒）",
+    "hint": "Key 因鉴权、额度或限流失败后暂停使用的时长",
+    "default": 600
+  },
+  "search_max_results": {
+    "type": "int",
+    "description": "搜索条数上限",
+    "hint": "控制每次搜索调用的返回数量（1-100）",
+    "default": 10,
+    "slider": {"min": 1, "max": 100, "step": 1}
+  },
+  "max_content_chars": {
+    "type": "int",
+    "description": "单页内容最大字符数",
+    "hint": "每页返回给 LLM 的正文最大字符数，超出截断",
+    "default": 8000
+  },
+  "site_max_pages": {
+    "type": "int",
+    "description": "站点任务页数上限",
+    "hint": "map、crawl、batch 的页数上限",
+    "default": 50
+  },
+  "pdf_max_pages": {
+    "type": "int",
+    "description": "PDF 解析页数上限",
+    "hint": "每次抓取解析的 PDF 最大页数（1-10000），同时用于费用预估",
+    "default": 20,
+    "slider": {"min": 1, "max": 10000, "step": 1}
+  },
+  "max_estimated_credits_per_call": {
+    "type": "int",
+    "description": "单次调用预估 credits 上限",
+    "hint": "预估超过上限的调用直接拒绝；0 表示不启用",
+    "default": 0
+  },
+  "daily_credit_limit": {
+    "type": "int",
+    "description": "每日 credits 上限",
+    "hint": "插件本地预算，按 UTC 自然日计算；0 表示不启用",
+    "default": 0
+  },
+  "max_concurrent_requests": {
+    "type": "int",
+    "description": "最大并发请求数",
+    "hint": "插件自身同时进行的 Firecrawl 请求数",
+    "default": 4
+  },
+  "check_prompt_injection": {
+    "type": "bool",
+    "description": "提示注入检测",
+    "hint": "默认是否请求 Firecrawl 做提示注入检测；开启会增加费用",
+    "default": false
+  },
+  "site_admin_only": {
+    "type": "bool",
+    "description": "站点任务仅管理员",
+    "hint": "开启后 crawl 和 batch 只有管理员能发起",
+    "default": true
+  },
+  "blocked_domains": {
+    "type": "list",
+    "description": "高价域名列表",
+    "hint": "按规范化 host 和子域名匹配；search 带正文、scrape、crawl、batch 时拒绝或预先排除",
+    "default": ["x.com", "twitter.com", "mobile.twitter.com", "linkedin.com"]
+  }
+}
