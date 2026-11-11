@@ -8,6 +8,7 @@
 - 单页抓取：返回 Markdown、摘要、链接、HTML、页面问答或 JSON 抽取结果。
 - 站点任务：获取站点链接、爬取站点、批量抓取，并查询或取消异步任务。
 - 多 API Key 轮询：鉴权、额度或限流失败的 Key 会暂停使用。
+- 页面变更订阅：按周期检查指定页面，仅在实际变化时向原会话推送 git-diff。
 - 费用控制：支持单次预估上限、UTC 每日额度、并发限制和待决记录管理。
 
 ## 安装
@@ -42,7 +43,7 @@ https://github.com/piexian/astrbot_plugin_firecrawl
 | `max_concurrent_requests` | 插件同时发起的 Firecrawl 请求数上限 | `4` |
 | `check_prompt_injection` | 默认是否检测提示注入，完成检测时每页额外 4 credits | `false` |
 | `site_admin_only` | crawl 和 batch 是否仅管理员可用 | `true` |
-| `blocked_domains` | 带正文搜索、单页抓取和站点抓取的高价域名拦截列表 | `x.com`、`twitter.com`、`mobile.twitter.com`、`linkedin.com` |
+| `blocked_domains` | 带正文搜索、单页抓取、站点抓取和页面变更订阅的高价域名拦截列表 | `x.com`、`twitter.com`、`mobile.twitter.com`、`linkedin.com` |
 
 同一团队的多个 Key 共享 Firecrawl 团队额度和限流，插件不会自动识别它们是否属于同一团队。
 
@@ -71,15 +72,27 @@ https://github.com/piexian/astrbot_plugin_firecrawl
 /fc credit                                    # 查询团队额度与 Key 冷却状态
 /fc pending list                              # 查看待决预算记录
 /fc pending resolve <预留ID> <实际credits>      # 按人工核对的实际费用结算
+/fc watch add <url> <分钟>                    # 订阅页面变更检查
+/fc watch list                                # 查看当前会话的订阅
+/fc watch remove <订阅ID>                     # 删除订阅
+/fc watch check <订阅ID>                      # 立即检查一次订阅
 ```
 
 除 `/fc help` 外，上述指令仅管理员可用。
 
-这些指令使用 AstrBot 指令组注册，可在“插件 → 管理行为 → 指令”中查看和管理。裸 `/fc` 或 `/fc pending` 会显示对应指令树。
+这些指令使用 AstrBot 指令组注册，可在“插件 → 管理行为 → 指令”中查看和管理。裸 `/fc`、`/fc pending` 或 `/fc watch` 会显示对应指令树。
 
 请求结果不确定时，插件会保留待决记录。先在 Firecrawl 账单中核对，再使用 `pending resolve` 结算；只有确认请求未被受理时，才将实际 credits 填为 `0` 释放预留。
 
-LLM Tool 的远端错误会在 AstrBot 日志中记录状态码、错误码、request_id 和脱敏后的错误原文；每条日志最多 1000 字符，超出部分截断。
+LLM Tool 与页面变更订阅的远端错误会在 AstrBot 日志中记录状态码、错误码、request_id 和脱敏后的错误原文；每条日志最多 1000 字符，超出部分截断。
+
+### 页面变更订阅
+
+`/fc watch` 指令全部仅管理员可用，分钟数至少为 5。订阅绑定创建时所在的会话，`remove` 与 `check` 只能操作本会话的订阅。
+
+- `add` 不立即收费，首次检查在下一分钟定时唤醒时执行，之后按订阅周期检查，未到期时不发起网络请求。
+- 每次检查沿用单页抓取的预算与配置，包括 `blocked_domains`、`pdf_max_pages` 和 `check_prompt_injection`。
+- 只有 Firecrawl 返回 `changeStatus=changed` 时才向订阅会话推送 git-diff；`new`、`same`、`removed` 以及缺少变更跟踪数据时都不推送。通知最多 6000 字符，超出部分截断并标注完整长度。
 
 ## 费用与任务说明
 

@@ -43,17 +43,25 @@ class _StubFunctionTool:
 
 
 def _install_sdk_stub() -> None:
-    """安装 pytest 专用 AstrBot API stub，统一提供 FunctionTool 与 logger。"""
+    """安装 pytest 专用 AstrBot API stub，提供 FunctionTool、MessageChain 与 logger。"""
     api_module = types.ModuleType("astrbot.api")
     api_module.FunctionTool = _StubFunctionTool
     api_module.logger = logging.getLogger("astrbot.stub")
+    event_module = types.ModuleType("astrbot.api.event")
+    event_module.MessageChain = type(
+        "MessageChain",
+        (),
+        {"message": lambda self, text: setattr(self, "text", text) or self},
+    )
     root_module = types.ModuleType("astrbot")
     root_module.api = api_module
+    root_module.event = event_module
     sys.modules["astrbot"] = root_module
     sys.modules["astrbot.api"] = api_module
+    sys.modules["astrbot.api.event"] = event_module
 
 
-_SDK_MODULE_NAMES = ("astrbot", "astrbot.api")
+_SDK_MODULE_NAMES = ("astrbot", "astrbot.api", "astrbot.api.event")
 _MISSING = object()
 
 

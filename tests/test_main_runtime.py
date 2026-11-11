@@ -65,6 +65,7 @@ class _StubContext:
 
     def __init__(self) -> None:
         self.added_tools: list = []
+        self.cron_manager = _StubCronManager()
 
     def add_llm_tools(self, *tools) -> None:
         self.added_tools.extend(tools)
@@ -93,6 +94,58 @@ class _StubStarTools:
     def get_data_dir(cls, plugin_name=None) -> Path:
         cls.data_dir.mkdir(parents=True, exist_ok=True)
         return cls.data_dir
+
+
+class _StubCronManager:
+    """记录 basic job 增删与操作顺序的最小 CronManager 替身。"""
+
+    def __init__(self) -> None:
+        self.jobs: dict[str, SimpleNamespace] = {}
+        self.handlers: dict[str, object] = {}
+        self.deleted: list[str] = []
+        self.operations: list[str] = []
+        self._counter = 0
+
+    async def add_basic_job(
+        self,
+        *,
+        name,
+        cron_expression,
+        handler,
+        description=None,
+        timezone=None,
+        payload=None,
+        enabled=True,
+        persistent=False,
+    ):
+        self._counter += 1
+        job_id = f"job-{self._counter}"
+        self.jobs[job_id] = SimpleNamespace(
+            job_id=job_id,
+            name=name,
+            job_type="basic",
+            cron_expression=cron_expression,
+            timezone=timezone,
+            payload=payload or {},
+            persistent=persistent,
+            enabled=enabled,
+        )
+        self.handlers[job_id] = handler
+        self.operations.append(f"add:{name}")
+        return self.jobs[job_id]
+
+    async def delete_job(self, job_id: str) -> None:
+        self.deleted.append(job_id)
+        self.jobs.pop(job_id, None)
+        self.handlers.pop(job_id, None)
+        self.operations.append(f"delete:{job_id}")
+
+    async def list_jobs(self, job_type=None):
+        return [
+            job
+            for job in self.jobs.values()
+            if job_type is None or job.job_type == job_type
+        ]
 
 
 @pytest.fixture(scope="module")
@@ -126,6 +179,11 @@ def main_sdk():
         return lambda obj: obj
 
     event.AstrMessageEvent = type("AstrMessageEvent", (), {})
+    event.MessageChain = type(
+        "MessageChain",
+        (),
+        {"message": lambda self, text: setattr(self, "text", text) or self},
+    )
     event.filter = SimpleNamespace(
         command_group=command_group,
         permission_type=permission_type,
@@ -464,3 +522,123 @@ async def test_invalid_base_url_fails_without_client(main_sdk, monkeypatch, tmp_
     assert plugin.client is None
     assert plugin.key_pool is None
     assert plugin.store is None
+
+
+@pytest.mark.asyncio
+async def test_initialize_assembles_watch_and_binds_persistent_job(
+    main_sdk, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(_StubStarTools, "data_dir", tmp_path / "data")
+    plugin = _new_plugin(main_sdk.module, {"api_keys": [K1]})
+    await plugin.initialize()
+    try:
+        assert plugin.watch_store is not None
+        assert plugin.watch_service is not None
+        assert plugin.watch_host is not None
+        assert plugin.watch_store._db_path == plugin.store._db_path
+        assert plugin.context.cron_manager.jobs == {}
+        sub = await plugin.watch_store.create(
+            umo="u1", url="https://example.com/a", interval_minutes=5, tag="t1"
+        )
+        await plugin.watch_host.start(sub.id)
+        job = next(iter(plugin.context.cron_manager.jobs.values()))
+        assert job.persistent is True
+        assert job.timezone == "UTC"
+        assert (await plugin.watch_store.get(sub.id)).cron_job_id == job.job_id
+    finally:
+        await plugin.terminate()
+    assert plugin.context.cron_manager.jobs == {}
+    reopened = main_sdk.module.WatchStore(tmp_path / "data" / "firecrawl.sqlite3")
+    kept = await reopened.list_all()
+    assert len(kept) == 1
+    assert kept[0].cron_job_id is None
+
+
+@pytest.mark.asyncio
+async def test_terminate_stops_watch_jobs_before_draining_and_closing(
+    main_sdk, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(_StubStarTools, "data_dir", tmp_path / "data")
+    module = main_sdk.module
+    created: list = []
+    client_class = _tracking_client_class(module, created)
+    monkeypatch.setattr(module, "FirecrawlClient", client_class)
+    plugin = _new_plugin(module, {"api_keys": [K1]})
+    await plugin.initialize()
+    client = created[0]
+    sub = await plugin.watch_store.create(
+        umo="u1", url="https://example.com/a", interval_minutes=5, tag="t1"
+    )
+    await plugin.watch_host.start(sub.id)
+    try:
+        async with plugin.request_scope():
+            terminate_task = asyncio.create_task(plugin.terminate())
+            for _ in range(5):
+                await asyncio.sleep(0)
+            manager = plugin.context.cron_manager
+            assert manager.jobs == {}
+            assert manager.deleted, "watch job 应在排空等待前删除"
+            assert not terminate_task.done()
+            assert client.aclose_calls == 0
+        await terminate_task
+        assert client.aclose_calls == 1
+        assert plugin.client is None
+        assert plugin.watch_host is None
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_initialize_watch_failure_rolls_back_and_cleans_jobs(
+    main_sdk, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(_StubStarTools, "data_dir", tmp_path / "data")
+    module = main_sdk.module
+    real_store_class = module.WatchStore
+
+    class SeededStore(real_store_class):
+        """首次 list_all 播种两条遗留订阅，模拟重启前数据。"""
+
+        async def list_all(self):
+            subs = await real_store_class.list_all(self)
+            if not subs:
+                await real_store_class.create(
+                    self,
+                    umo="u1",
+                    url="https://example.com/a",
+                    interval_minutes=5,
+                    tag="seed-1",
+                )
+                await real_store_class.create(
+                    self,
+                    umo="u1",
+                    url="https://example.com/b",
+                    interval_minutes=5,
+                    tag="seed-2",
+                )
+                subs = await real_store_class.list_all(self)
+            return subs
+
+    class HalfFailingCronManager(_StubCronManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self._add_calls = 0
+
+        async def add_basic_job(self, **kwargs):
+            self._add_calls += 1
+            if self._add_calls >= 2:
+                raise RuntimeError("cron unavailable")
+            return await super().add_basic_job(**kwargs)
+
+    context = _StubContext()
+    context.cron_manager = HalfFailingCronManager()
+    monkeypatch.setattr(module, "WatchStore", SeededStore)
+    plugin = _new_plugin(module, {"api_keys": [K1]}, context)
+    with pytest.raises(RuntimeError):
+        await plugin.initialize()
+    assert context.cron_manager.jobs == {}
+    assert plugin.client is None
+    assert plugin.store is None
+    assert plugin.watch_store is None
+    assert plugin.watch_service is None
+    assert plugin.watch_host is None

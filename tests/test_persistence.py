@@ -14,7 +14,11 @@ from astrbot_plugin_firecrawl.firecrawl_api.budget import (
     InvalidBudgetTransition,
     ReservationState,
 )
-from astrbot_plugin_firecrawl.persistence import SQLiteStore, UsageSnapshot
+from astrbot_plugin_firecrawl.persistence import (
+    SQLiteStore,
+    UsageSnapshot,
+    WatchStore,
+)
 
 _DAY = "2026-01-01"
 _PAST = "2025-12-31"
@@ -57,8 +61,8 @@ async def test_initialize_is_idempotent_and_sets_version(tmp_path):
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
     }
     conn.close()
-    assert version == 1
-    assert {"daily_usage", "reservations"} <= tables
+    assert version == 2
+    assert {"daily_usage", "reservations", "watch_subscriptions"} <= tables
 
 
 @pytest.mark.asyncio
@@ -66,7 +70,7 @@ async def test_initialize_rejects_newer_schema_version(tmp_path):
     path = tmp_path / "budget.db"
     await make_store(path).initialize()
     conn = sqlite3.connect(path)
-    conn.execute("PRAGMA user_version = 2")
+    conn.execute("PRAGMA user_version = 3")
     conn.commit()
     conn.close()
     with pytest.raises(ValueError, match="schema 版本"):
@@ -78,13 +82,13 @@ async def test_initialize_reject_keeps_version_and_journal_mode(tmp_path):
     path = tmp_path / "budget.db"
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA journal_mode=DELETE")
-    conn.execute("PRAGMA user_version = 2")
+    conn.execute("PRAGMA user_version = 3")
     conn.commit()
     conn.close()
     with pytest.raises(ValueError, match="schema 版本"):
         await make_store(path).initialize()
     conn = sqlite3.connect(path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
     assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
     conn.close()
 
@@ -834,3 +838,295 @@ async def test_naive_clock_rejected_before_any_write(tmp_path):
         )
     with pytest.raises(KeyError):
         await naive.get("r-n")
+
+
+class _TickClock:
+    """可手动推进的 UTC clock，用于验证订阅周期推进。"""
+
+    def __init__(self, start: datetime) -> None:
+        self._now = start
+
+    def __call__(self) -> datetime:
+        return self._now
+
+    def advance(self, **kwargs) -> None:
+        self._now += timedelta(**kwargs)
+
+
+def make_watch_store(db_path: str | Path, clock=None) -> WatchStore:
+    """在指定路径创建 WatchStore，缺省使用固定 clock。"""
+    return WatchStore(db_path, clock=clock or fixed_clock)
+
+
+def _plant_v1_database(path: str | Path) -> None:
+    """手工搭建 v1 schema 并写入预算数据，用于 v1→v2 迁移回归。"""
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE daily_usage (
+            utc_day TEXT PRIMARY KEY,
+            used REAL NOT NULL CHECK (used >= 0)
+        );
+        CREATE TABLE reservations (
+            reservation_id TEXT PRIMARY KEY,
+            utc_day TEXT NOT NULL,
+            estimate INTEGER NOT NULL
+                CHECK (typeof(estimate) = 'integer' AND estimate >= 0),
+            kind TEXT NOT NULL,
+            request_fingerprint TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('reserved','submitting','accepted',
+                'indeterminate','settled','released')),
+            key_ref TEXT,
+            job_id TEXT,
+            actual_credits REAL CHECK (actual_credits IS NULL OR actual_credits >= 0),
+            accounted_credits REAL NOT NULL CHECK (accounted_credits >= 0)
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO reservations (reservation_id, utc_day, estimate, kind,"
+        " request_fingerprint, created_at, updated_at, state, key_ref, job_id,"
+        " actual_credits, accounted_credits)"
+        " VALUES ('r-old', ?, 4, 'scrape', ?, ?, ?, 'settled', NULL, NULL, 4.0, 4.0)",
+        (_DAY, fp(7), _STAMP, _STAMP),
+    )
+    conn.execute("INSERT INTO daily_usage (utc_day, used) VALUES (?, 4.0)", (_DAY,))
+    conn.execute("PRAGMA user_version = 1")
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_watch_migration_upgrades_v1_and_preserves_budget_data(tmp_path):
+    path = tmp_path / "mixed.db"
+    _plant_v1_database(path)
+    store = make_watch_store(path)
+    await store.initialize()
+    conn = sqlite3.connect(path)
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    tables = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    kept = conn.execute(
+        "SELECT reservation_id, state, accounted_credits FROM reservations"
+        " WHERE reservation_id = 'r-old'"
+    ).fetchone()
+    used = conn.execute(
+        "SELECT used FROM daily_usage WHERE utc_day = ?", (_DAY,)
+    ).fetchone()
+    conn.close()
+    assert version == 2
+    assert "watch_subscriptions" in tables
+    assert kept == ("r-old", "settled", 4.0)
+    assert used == (4.0,)
+    await store.initialize()
+
+
+@pytest.mark.asyncio
+async def test_watch_store_creates_subscription_with_defaults(tmp_path):
+    store = make_watch_store(tmp_path / "watch.db")
+    await store.initialize()
+    record = await store.create(
+        umo="qq:group:123", url="https://example.com/a", interval_minutes=5, tag="tag-1"
+    )
+    assert len(record.id) == 36 and record.id.count("-") == 4
+    assert record.cron_job_id is None
+    assert record.last_status is None
+    assert record.last_notification_hash is None
+    assert record.next_check_at == "2026-01-01T12:00:00+00:00"
+    assert record.created_at == record.updated_at == "2026-01-01T12:00:00+00:00"
+    assert await store.get(record.id) == record
+
+
+@pytest.mark.asyncio
+async def test_watch_store_normalizes_url_whitespace(tmp_path):
+    store = make_watch_store(tmp_path / "watch.db")
+    await store.initialize()
+    record = await store.create(
+        umo="u",
+        url="  https://example.com/a  ",
+        interval_minutes=5,
+        tag="t",
+    )
+    assert record.url == "https://example.com/a"
+
+
+@pytest.mark.asyncio
+async def test_watch_store_rejects_duplicate_umo_url_and_tag(tmp_path):
+    store = make_watch_store(tmp_path / "watch.db")
+    await store.initialize()
+    await store.create(
+        umo="umo-1", url="https://example.com/a", interval_minutes=5, tag="tag-1"
+    )
+    with pytest.raises(ValueError, match="同一会话"):
+        await store.create(
+            umo="umo-1", url="https://example.com/a", interval_minutes=10, tag="tag-2"
+        )
+    with pytest.raises(ValueError, match="tag 已被"):
+        await store.create(
+            umo="umo-2", url="https://example.com/b", interval_minutes=5, tag="tag-1"
+        )
+    assert len(await store.list_all()) == 1
+
+
+@pytest.mark.asyncio
+async def test_watch_store_validates_inputs(tmp_path):
+    store = make_watch_store(tmp_path / "watch.db")
+    await store.initialize()
+    for bad_interval in (4, 0, True, 1.5, "5"):
+        with pytest.raises(ValueError, match="interval_minutes"):
+            await store.create(
+                umo="u",
+                url="https://example.com/a",
+                interval_minutes=bad_interval,
+                tag="t",
+            )
+    for bad_url in ("example.com/a", "ftp://x.com/a", "", "https://a b.com"):
+        with pytest.raises(ValueError):
+            await store.create(umo="u", url=bad_url, interval_minutes=5, tag="t")
+    with pytest.raises(ValueError, match="umo"):
+        await store.create(
+            umo="  ", url="https://example.com/a", interval_minutes=5, tag="t"
+        )
+    with pytest.raises(ValueError, match="tag"):
+        await store.create(
+            umo="u", url="https://example.com/a", interval_minutes=5, tag=""
+        )
+    assert len(await store.list_all()) == 0
+
+
+@pytest.mark.asyncio
+async def test_watch_store_set_cron_job_id_and_clear(tmp_path):
+    store = make_watch_store(tmp_path / "watch.db")
+    await store.initialize()
+    record = await store.create(
+        umo="u", url="https://example.com/a", interval_minutes=5, tag="t"
+    )
+    bound = await store.set_cron_job_id(record.id, "job-1")
+    assert bound.cron_job_id == "job-1"
+    assert bound.updated_at == "2026-01-01T12:00:00+00:00"
+    for bad in ("", 123):
+        with pytest.raises(ValueError):
+            await store.set_cron_job_id(record.id, bad)
+    assert (await store.get(record.id)).cron_job_id == "job-1"
+    cleared = await store.set_cron_job_id(record.id, None)
+    assert cleared.cron_job_id is None
+
+
+@pytest.mark.asyncio
+async def test_watch_store_record_check_advances_next_check(tmp_path):
+    clock = _TickClock(datetime.fromisoformat("2026-03-01T08:00:00+00:00"))
+    store = make_watch_store(tmp_path / "watch.db", clock=clock)
+    await store.initialize()
+    record = await store.create(
+        umo="u", url="https://example.com/a", interval_minutes=30, tag="t"
+    )
+    assert record.next_check_at == "2026-03-01T08:00:00+00:00"
+    clock.advance(minutes=30)
+    checked = await store.record_check(record.id, "changed")
+    assert checked.last_status == "changed"
+    assert checked.next_check_at == "2026-03-01T09:00:00+00:00"
+    clock.advance(minutes=30)
+    again = await store.record_check(record.id, "same")
+    assert again.last_status == "same"
+    assert again.next_check_at == "2026-03-01T09:30:00+00:00"
+    assert again.created_at == "2026-03-01T08:00:00+00:00"
+    cleared = await store.record_check(record.id, None)
+    assert cleared.last_status is None
+    with pytest.raises(KeyError, match="未知订阅"):
+        await store.record_check("missing", "new")
+
+
+@pytest.mark.asyncio
+async def test_watch_store_create_first_check_due_immediately(tmp_path):
+    """首次 next_check_at 为创建时刻，首检由下一分钟 cron 唤醒执行。"""
+    clock = _TickClock(datetime.fromisoformat("2026-03-01T08:07:30+00:00"))
+    store = make_watch_store(tmp_path / "watch.db", clock=clock)
+    await store.initialize()
+    record = await store.create(
+        umo="u", url="https://example.com/a", interval_minutes=45, tag="t"
+    )
+    assert record.next_check_at == record.created_at == "2026-03-01T08:07:30+00:00"
+    clock.advance(minutes=45)
+    checked = await store.record_check(record.id, "same")
+    assert checked.next_check_at == "2026-03-01T09:37:30+00:00"
+
+
+@pytest.mark.asyncio
+async def test_watch_store_save_notification_hash(tmp_path):
+    store = make_watch_store(tmp_path / "watch.db")
+    await store.initialize()
+    record = await store.create(
+        umo="u", url="https://example.com/a", interval_minutes=5, tag="t"
+    )
+    saved = await store.save_notification_hash(record.id, "a" * 64)
+    assert saved.last_notification_hash == "a" * 64
+    for bad in ("A" * 64, "a" * 63, 123):
+        with pytest.raises(ValueError, match="notification_hash"):
+            await store.save_notification_hash(record.id, bad)
+    assert (await store.get(record.id)).last_notification_hash == "a" * 64
+
+
+@pytest.mark.asyncio
+async def test_watch_store_delete_and_list_order(tmp_path):
+    store = make_watch_store(tmp_path / "watch.db")
+    await store.initialize()
+    first = await store.create(
+        umo="u1", url="https://example.com/a", interval_minutes=5, tag="t1"
+    )
+    second = await store.create(
+        umo="u2", url="https://example.com/b", interval_minutes=5, tag="t2"
+    )
+    assert len(await store.list_all()) == 2
+    await store.delete(first.id)
+    with pytest.raises(KeyError, match="未知订阅"):
+        await store.get(first.id)
+    with pytest.raises(KeyError, match="未知订阅"):
+        await store.delete(first.id)
+    remaining = await store.list_all()
+    assert [r.id for r in remaining] == [second.id]
+
+
+@pytest.mark.asyncio
+async def test_watch_store_reopen_preserves_all_fields(tmp_path):
+    path = tmp_path / "watch.db"
+    store = make_watch_store(path)
+    await store.initialize()
+    record = await store.create(
+        umo="u", url="https://example.com/a", interval_minutes=15, tag="t"
+    )
+    await store.set_cron_job_id(record.id, "job-9")
+    await store.record_check(record.id, "changed")
+    await store.save_notification_hash(record.id, "b" * 64)
+    reopened = make_watch_store(path)
+    await reopened.initialize()
+    restored = await reopened.get(record.id)
+    assert restored == await store.get(record.id)
+    assert restored.cron_job_id == "job-9"
+    assert restored.last_status == "changed"
+    assert restored.last_notification_hash == "b" * 64
+    assert restored.next_check_at == "2026-01-01T12:15:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_watch_store_naive_clock_rejected_before_write(tmp_path):
+    path = tmp_path / "watch.db"
+    store = make_watch_store(path)
+    await store.initialize()
+    naive = make_watch_store(path, clock=lambda: datetime(2026, 1, 1))
+    with pytest.raises(ValueError, match="timezone-aware"):
+        await naive.create(
+            umo="u", url="https://example.com/a", interval_minutes=5, tag="t"
+        )
+    record = await store.create(
+        umo="u", url="https://example.com/a", interval_minutes=5, tag="t"
+    )
+    await store.set_cron_job_id(record.id, "job-1")
+    with pytest.raises(ValueError, match="timezone-aware"):
+        await naive.record_check(record.id, "new")
+    with pytest.raises(ValueError, match="timezone-aware"):
+        await naive.set_cron_job_id(record.id, "job-2")
+    assert (await store.get(record.id)).cron_job_id == "job-1"

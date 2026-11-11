@@ -12,7 +12,11 @@ _ALLOWED_LOGGER_MODULE = "astrbot.api"
 
 def test_production_logging_imports_are_astrbot_only():
     """生产模块不得绕过 AstrBot logger，使用 logger 时必须显式从 astrbot.api 导入。"""
-    paths = [*_ROOT.glob("firecrawl_api/*.py"), *_ROOT.glob("tools/*.py")]
+    paths = [
+        *_ROOT.glob("firecrawl_api/*.py"),
+        *_ROOT.glob("tools/*.py"),
+        *_ROOT.glob("watch/*.py"),
+    ]
     paths.extend([_ROOT / "main.py", _ROOT / "persistence.py"])
     assert paths
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -62,14 +63,80 @@ class _StubLogger:
         self._record("ERROR", message, *args)
 
 
+class _StubCronManager:
+    """记录 basic job 增删的最小 CronManager 替身。"""
+
+    def __init__(self, fail_add: bool = False) -> None:
+        self.jobs: dict[str, SimpleNamespace] = {}
+        self.handlers: dict[str, object] = {}
+        self.deleted: list[str] = []
+        self.fail_add = fail_add
+        self._counter = 0
+
+    async def add_basic_job(
+        self,
+        *,
+        name,
+        cron_expression,
+        handler,
+        description=None,
+        timezone=None,
+        payload=None,
+        enabled=True,
+        persistent=False,
+    ):
+        if self.fail_add:
+            raise RuntimeError("cron unavailable")
+        self._counter += 1
+        job_id = f"job-{self._counter}"
+        self.jobs[job_id] = SimpleNamespace(
+            job_id=job_id,
+            name=name,
+            job_type="basic",
+            cron_expression=cron_expression,
+            timezone=timezone,
+            payload=payload or {},
+            persistent=persistent,
+            enabled=enabled,
+        )
+        self.handlers[job_id] = handler
+        return self.jobs[job_id]
+
+    async def delete_job(self, job_id: str) -> None:
+        self.deleted.append(job_id)
+        self.jobs.pop(job_id, None)
+        self.handlers.pop(job_id, None)
+
+    async def list_jobs(self, job_type=None):
+        return [
+            job
+            for job in self.jobs.values()
+            if job_type is None or job.job_type == job_type
+        ]
+
+
+class _StubMessageChain:
+    """与 MessageChain 同形的最小替身。"""
+
+    def message(self, text: str):
+        self.text = text
+        return self
+
+
 class _StubContext:
-    """最小 Context 替身。"""
+    """最小 Context 替身：LLM 工具注册、cron 管理与会话推送记录。"""
 
     def __init__(self) -> None:
         self.added_tools: list = []
+        self.cron_manager = _StubCronManager()
+        self.sent: list[tuple[str, str]] = []
 
     def add_llm_tools(self, *tools) -> None:
         self.added_tools.extend(tools)
+
+    async def send_message(self, umo: str, chain) -> bool:
+        self.sent.append((umo, chain.text))
+        return True
 
 
 class _StubStar:
@@ -91,11 +158,12 @@ class _StubStarTools:
 
 
 class StubEvent:
-    """最小事件替身：消息文本、管理员身份与 plain_result 输出收集。"""
+    """最小事件替身：消息文本、管理员身份、会话与 plain_result 输出收集。"""
 
-    def __init__(self, message: str, is_admin: bool) -> None:
+    def __init__(self, message: str, is_admin: bool, umo: str = "") -> None:
         self._message = message
         self._is_admin = is_admin
+        self.unified_msg_origin = umo
         self.outputs: list = []
 
     def get_message_str(self) -> str:
@@ -128,6 +196,7 @@ def main_sdk():
     star.StarTools = _StubStarTools
     event_module = types.ModuleType("astrbot.api.event")
     event_module.AstrMessageEvent = type("AstrMessageEvent", (), {})
+    event_module.MessageChain = _StubMessageChain
     registered: list[dict[str, object]] = []
 
     def _register(full_name, func, *, is_group):
@@ -241,10 +310,19 @@ def _recording_transport(calls: list, responder=None):
     return httpx.MockTransport(handler)
 
 
-async def _wired_plugin(main_sdk, tmp_path, *, keys=(K1, K2), transport=None):
-    """直接装配运行时属性：真实 SQLiteStore 与可选 MockTransport 客户端。"""
+async def _wired_plugin(
+    main_sdk,
+    tmp_path,
+    *,
+    keys=(K1, K2),
+    transport=None,
+    with_watch=True,
+    config=None,
+):
+    """直接装配运行时属性：真实 SQLiteStore、可选 MockTransport 与 watch 运行时。"""
     module = main_sdk.module
-    plugin = module.FirecrawlPlugin(_StubContext(), {"api_keys": list(keys)})
+    context = _StubContext()
+    plugin = module.FirecrawlPlugin(context, {"api_keys": list(keys), **(config or {})})
     pool = module.KeyPool(list(keys))
     store = module.SQLiteStore(tmp_path / "commands.sqlite3")
     await store.initialize()
@@ -254,11 +332,18 @@ async def _wired_plugin(main_sdk, tmp_path, *, keys=(K1, K2), transport=None):
     plugin.key_pool = pool
     plugin.store = store
     plugin.client = client
+    plugin.executor = module.BudgetedExecutor(client, store)
     plugin._semaphore = asyncio.Semaphore(2)
+    if with_watch:
+        watch_store = module.WatchStore(tmp_path / "commands.sqlite3")
+        await watch_store.initialize()
+        plugin.watch_store = watch_store
+        plugin.watch_service = module.WatchService(plugin, watch_store)
+        plugin.watch_host = module.WatchHost(context, plugin.watch_service, watch_store)
     return plugin
 
 
-async def _run(plugin, message: str, *, admin: bool = True) -> str:
+async def _run(plugin, message: str, *, admin: bool = True, umo: str = "") -> str:
     """按官方指令名调用对应 handler；裸指令组与未知指令不在此模拟。"""
     text = message.strip().removeprefix("/")
     parts = text.split()
@@ -267,8 +352,8 @@ async def _run(plugin, message: str, *, admin: bool = True) -> str:
     parts = parts[1:]
     if not parts:
         raise AssertionError("裸 fc 由 AstrBot 指令组显示指令树")
-    event = StubEvent(message, admin)
     action, rest = parts[0], parts[1:]
+    event = StubEvent(message, admin, umo)
     if action == "help":
         return _text(await plugin.fc_help(event))
     if action == "credit":
@@ -288,6 +373,24 @@ async def _run(plugin, message: str, *, admin: bool = True) -> str:
                     event, reservation_id, actual_credits, extra
                 )
             )
+    if action == "watch" and rest:
+        sub_action, values = rest[0], rest[1:]
+        if sub_action == "add":
+            url = values[0] if values else ""
+            minutes = values[1] if len(values) > 1 else ""
+            extra = " ".join(values[2:]) if len(values) > 2 else _StubGreedyStr
+            return _text(await plugin.fc_watch_add(event, url, minutes, extra))
+        if sub_action == "list":
+            extra = " ".join(values) if values else _StubGreedyStr
+            return _text(await plugin.fc_watch_list(event, extra))
+        if sub_action == "remove":
+            sub_id = values[0] if values else ""
+            extra = " ".join(values[1:]) if len(values) > 1 else _StubGreedyStr
+            return _text(await plugin.fc_watch_remove(event, sub_id, extra))
+        if sub_action == "check":
+            sub_id = values[0] if values else ""
+            extra = " ".join(values[1:]) if len(values) > 1 else _StubGreedyStr
+            return _text(await plugin.fc_watch_check(event, sub_id, extra))
     raise AssertionError(f"未注册的 fc 指令：{message}")
 
 
@@ -320,6 +423,11 @@ def test_fc_command_group_tree_registered(main_sdk):
         "fc pending",
         "fc pending list",
         "fc pending resolve",
+        "fc watch",
+        "fc watch add",
+        "fc watch list",
+        "fc watch remove",
+        "fc watch check",
     ]
     assert records["fc"]["is_group"] is True
     assert records["fc pending"]["is_group"] is True
@@ -706,5 +814,244 @@ async def test_pending_list_read_failure_returns_fixed_text(main_sdk, tmp_path):
         logged = "\n".join(main_sdk.logger.messages[start:])
         assert "RuntimeError" in logged
         assert "SECRET" not in logged
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_watch_commands_registered_as_admin(main_sdk, tmp_path):
+    plugin = await _wired_plugin(main_sdk, tmp_path)
+    try:
+        records = {record["name"]: record for record in main_sdk.registered}
+        assert records["fc watch"]["is_group"] is True
+        assert records["fc watch"]["admin"] is True
+        for command in ("add", "list", "remove", "check"):
+            record = records[f"fc watch {command}"]
+            assert record["is_group"] is False
+            assert record["admin"] is True
+        assert "/fc watch" in await _run(plugin, "/fc help")
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_watch_add_creates_subscription_and_job(main_sdk, tmp_path):
+    plugin = await _wired_plugin(main_sdk, tmp_path)
+    try:
+        text = await _run(plugin, "/fc watch add https://example.com/a 10", umo="u1")
+        assert "已订阅" in text and "订阅ID" in text
+        subs = await plugin.watch_store.list_all()
+        assert len(subs) == 1
+        sub = subs[0]
+        assert sub.umo == "u1"
+        assert sub.url == "https://example.com/a"
+        assert sub.interval_minutes == 10
+        assert sub.tag.startswith("fcwatch-")
+        assert sub.next_check_at == sub.created_at
+        jobs = plugin.context.cron_manager.jobs
+        assert len(jobs) == 1
+        job = next(iter(jobs.values()))
+        assert job.payload == {"subscription_id": sub.id}
+        assert (await plugin.watch_store.get(sub.id)).cron_job_id == job.job_id
+        again = await _run(plugin, "/fc watch add https://example.com/a 15", umo="u1")
+        assert "同一会话已订阅此 URL" in again
+        assert len(await plugin.watch_store.list_all()) == 1
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_watch_add_rejects_bad_args_without_state(main_sdk, tmp_path):
+    plugin = await _wired_plugin(main_sdk, tmp_path)
+    try:
+        assert "用法" in await _run(plugin, "/fc watch add", umo="u1")
+        assert "用法" in await _run(
+            plugin, "/fc watch add https://example.com/a", umo="u1"
+        )
+        assert "用法" in await _run(
+            plugin, "/fc watch add https://example.com/a abc", umo="u1"
+        )
+        assert "订阅失败" in await _run(
+            plugin, "/fc watch add https://example.com/a 3", umo="u1"
+        )
+        assert "用法" in await _run(
+            plugin, "/fc watch add https://example.com/a 10 多余", umo="u1"
+        )
+        assert "会话" in await _run(
+            plugin, "/fc watch add https://example.com/a 10", umo=""
+        )
+        assert await plugin.watch_store.list_all() == []
+        assert plugin.context.cron_manager.jobs == {}
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_watch_add_rolls_back_when_cron_fails(main_sdk, tmp_path):
+    plugin = await _wired_plugin(main_sdk, tmp_path)
+    plugin.context.cron_manager.fail_add = True
+    try:
+        text = await _run(plugin, "/fc watch add https://example.com/a 10", umo="u1")
+        assert "已回滚" in text
+        assert await plugin.watch_store.list_all() == []
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_watch_list_filters_by_current_umo(main_sdk, tmp_path):
+    plugin = await _wired_plugin(main_sdk, tmp_path)
+    try:
+        await _run(plugin, "/fc watch add https://example.com/a 10", umo="u1")
+        await _run(plugin, "/fc watch add https://example.com/b 15", umo="u1")
+        await _run(plugin, "/fc watch add https://example.com/c 5", umo="u2")
+        text = await _run(plugin, "/fc watch list", umo="u1")
+        assert "共 2 个" in text
+        assert "https://example.com/a" in text
+        assert "https://example.com/c" not in text
+        empty = await _run(plugin, "/fc watch list", umo="u3")
+        assert "没有" in empty
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_watch_remove_deletes_subscription_and_job(main_sdk, tmp_path):
+    plugin = await _wired_plugin(main_sdk, tmp_path)
+    try:
+        await _run(plugin, "/fc watch add https://example.com/a 10", umo="u1")
+        sub = (await plugin.watch_store.list_all())[0]
+        result = await _run(plugin, f"/fc watch remove {sub.id}", umo="u1")
+        assert "已删除" in result
+        assert await plugin.watch_store.list_all() == []
+        assert plugin.context.cron_manager.jobs == {}
+        assert "不存在" in await _run(plugin, f"/fc watch remove {sub.id}", umo="u1")
+        await _run(plugin, "/fc watch add https://example.com/b 10", umo="u2")
+        other = (await plugin.watch_store.list_all())[0]
+        cross = await _run(plugin, f"/fc watch remove {other.id}", umo="u1")
+        assert "不属于当前会话" in cross
+        assert len(await plugin.watch_store.list_all()) == 1
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_watch_check_runs_and_pushes_changed(main_sdk, tmp_path):
+    calls: list = []
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "creditsUsed": 21,
+                "data": {
+                    "markdown": "body",
+                    "changeTracking": {
+                        "previousScrapeAt": "2026-05-01T00:00:00+00:00",
+                        "changeStatus": "changed",
+                        "visibility": "visible",
+                        "diff": {"text": "- old\n+ new"},
+                    },
+                },
+            },
+        )
+
+    plugin = await _wired_plugin(
+        main_sdk, tmp_path, transport=_recording_transport(calls, responder)
+    )
+    try:
+        await _run(plugin, "/fc watch add https://example.com/a 10", umo="u1")
+        sub = (await plugin.watch_store.list_all())[0]
+        text = await _run(plugin, f"/fc watch check {sub.id}", umo="u1")
+        assert "已推送" in text
+        assert plugin.context.sent[0][0] == "u1"
+        assert "- old" in plugin.context.sent[0][1]
+        assert len(calls) == 2
+        payload = json.loads(calls[0].content)
+        assert payload["formats"][-1]["type"] == "changeTracking"
+        saved = await plugin.watch_store.get(sub.id)
+        assert saved.last_status == "changed"
+        assert saved.last_notification_hash is not None
+        again = await _run(plugin, f"/fc watch check {sub.id}", umo="u1")
+        assert "已跳过" in again
+        assert len(plugin.context.sent) == 1
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_watch_check_missing_tracking_and_unknown_id(main_sdk, tmp_path):
+    calls: list = []
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"success": True, "data": {"markdown": "b"}})
+
+    plugin = await _wired_plugin(
+        main_sdk, tmp_path, transport=_recording_transport(calls, responder)
+    )
+    try:
+        assert "不存在" in await _run(plugin, "/fc watch check missing", umo="u1")
+        await _run(plugin, "/fc watch add https://example.com/a 10", umo="u1")
+        sub = (await plugin.watch_store.list_all())[0]
+        text = await _run(plugin, f"/fc watch check {sub.id}", umo="u1")
+        assert "变更跟踪数据" in text
+        saved = await plugin.watch_store.get(sub.id)
+        assert saved.last_status == "unavailable"
+        assert saved.next_check_at > saved.created_at
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_watch_commands_require_watch_runtime(main_sdk, tmp_path):
+    plugin = await _wired_plugin(main_sdk, tmp_path, with_watch=False)
+    try:
+        text = await _run(plugin, "/fc watch add https://example.com/a 10", umo="u1")
+        assert "运行时不可用" in text
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_watch_add_rejects_blocked_url_without_state(main_sdk, tmp_path):
+    plugin = await _wired_plugin(
+        main_sdk, tmp_path, config={"blocked_domains": ["x.com"]}
+    )
+    try:
+        text = await _run(plugin, "/fc watch add https://x.com/post 10", umo="u1")
+        assert "订阅失败" in text
+        assert await plugin.watch_store.list_all() == []
+        assert plugin.context.cron_manager.jobs == {}
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_watch_remove_failure_keeps_subscription_for_retry(main_sdk, tmp_path):
+    plugin = await _wired_plugin(main_sdk, tmp_path)
+    try:
+        await _run(plugin, "/fc watch add https://example.com/a 10", umo="u1")
+        sub = (await plugin.watch_store.list_all())[0]
+        manager = plugin.context.cron_manager
+        original_delete = manager.delete_job
+
+        async def failing_delete(job_id):
+            raise RuntimeError("cron unavailable")
+
+        manager.delete_job = failing_delete
+        text = await _run(plugin, f"/fc watch remove {sub.id}", umo="u1")
+        assert "删除失败" in text
+        saved = await plugin.watch_store.get(sub.id)
+        assert saved.url == "https://example.com/a"
+        assert saved.cron_job_id is not None
+        assert len(manager.jobs) == 1
+        manager.delete_job = original_delete
+        retry = await _run(plugin, f"/fc watch remove {sub.id}", umo="u1")
+        assert "已删除" in retry
+        assert await plugin.watch_store.list_all() == []
+        assert manager.jobs == {}
     finally:
         await plugin.terminate()

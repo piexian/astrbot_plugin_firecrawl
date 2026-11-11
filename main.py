@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import re
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -22,11 +23,13 @@ from .firecrawl_api.errors import (
     mask_key,
 )
 from .firecrawl_api.keys import KeyPool
-from .persistence import SQLiteStore
+from .persistence import SQLiteStore, WatchStore
 from .tools.execution import BudgetedExecutor
 from .tools.scrape import FirecrawlScrapeTool
 from .tools.search import FirecrawlSearchTool
 from .tools.site import FirecrawlSiteTool
+from .watch.host import WatchHost
+from .watch.service import WatchService
 
 _DEFAULT_BASE_URL = "https://api.firecrawl.dev"
 _DB_FILENAME = "firecrawl.sqlite3"
@@ -37,7 +40,8 @@ _HELP_TEXT = (
     "/fc help — 显示本帮助\n"
     "/fc credit — 查询团队额度与 Key 冷却状态（管理员）\n"
     "/fc pending list — 查看待决预算预留（管理员）\n"
-    "/fc pending resolve <预留ID> <实际credits> — 结算或确认未受理，0 表示未受理（管理员）"
+    "/fc pending resolve <预留ID> <实际credits> — 结算或确认未受理，0 表示未受理（管理员）\n"
+    "/fc watch add/list/remove/check — 管理页面变更订阅（管理员）\n"
 )
 _CREDIT_USAGE_TEXT = "用法：/fc credit。"
 _NO_KEY_TEXT = "尚未配置 Firecrawl API Key，无法查询额度。"
@@ -57,6 +61,13 @@ _OUTPUT_LIMIT = 6000
 _PENDING_LIST_LIMIT = 20
 _CREDIT_ENDPOINT = "/team/credit-usage"
 _AMOUNT_PATTERN = re.compile(r"\d{1,12}(?:\.\d{1,6})?")
+
+_WATCH_NO_UMO_TEXT = "无法确定当前会话，不能管理页面变更订阅。"
+_WATCH_ADD_USAGE_TEXT = "用法：/fc watch add <url> <分钟数>，分钟数至少为 5。"
+_WATCH_LIST_USAGE_TEXT = "用法：/fc watch list。"
+_WATCH_ID_USAGE_TEXT = "用法：/fc watch remove <订阅ID> 或 /fc watch check <订阅ID>。"
+_WATCH_NOT_FOUND_TEXT = "订阅不存在或不属于当前会话。"
+_WATCH_REMOVE_FAILED_TEXT = "订阅删除失败：定时任务暂不可用，订阅已保留，请稍后重试。"
 
 
 def _truncate(text: str) -> str:
@@ -202,6 +213,9 @@ class FirecrawlPlugin(Star):
         self._drained.set()
         self._closing = False
         self._terminated = False
+        self.watch_store: WatchStore | None = None
+        self.watch_service: WatchService | None = None
+        self.watch_host: WatchHost | None = None
 
     async def initialize(self) -> None:
         """装配运行时：预算存储、恢复、Key 池、客户端与工具注册，失败即回滚。"""
@@ -246,7 +260,19 @@ class FirecrawlPlugin(Star):
                 FirecrawlScrapeTool(plugin=self),
                 FirecrawlSiteTool(plugin=self),
             )
+            watch_store = WatchStore(data_dir / _DB_FILENAME)
+            await watch_store.initialize()
+            self.watch_store = watch_store
+            self.watch_service = WatchService(self, watch_store)
+            self.watch_host = WatchHost(self.context, self.watch_service, watch_store)
+            await self.watch_host.reload()
         except BaseException:
+            host = self.watch_host
+            if host is not None:
+                try:
+                    await host.stop()
+                except BaseException as exc:
+                    logger.warning("watch 调度清理失败：%s", type(exc).__name__)
             if client is not None:
                 await client.aclose()
             self._release_runtime()
@@ -254,11 +280,14 @@ class FirecrawlPlugin(Star):
             raise
 
     async def terminate(self) -> None:
-        """关闭运行时：拒绝新请求、等待在途请求排空后关闭客户端；可重复调用。"""
+        """关闭运行时：先停 watch 调度，等待在途请求排空后关闭客户端；可重复调用。"""
         self._closing = True
         if self._terminated:
             return
         self._terminated = True
+        host = self.watch_host
+        if host is not None:
+            await host.stop()
         await self._drained.wait()
         client = self.client
         if client is not None:
@@ -292,6 +321,9 @@ class FirecrawlPlugin(Star):
         self.client = None
         self.store = None
         self.executor = None
+        self.watch_store = None
+        self.watch_service = None
+        self.watch_host = None
         self._semaphore = None
         self._active_scopes = set()
         self._drained = asyncio.Event()
@@ -440,3 +472,138 @@ class FirecrawlPlugin(Star):
         except Exception as exc:
             logger.warning("fc pending resolve 处理异常：%s", type(exc).__name__)
             return _RESOLVE_FAILED_TEXT
+
+    @fc.group("watch")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    def fc_watch(self):
+        """管理页面变更订阅（管理员）。"""
+        pass
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @fc_watch.command("add")
+    async def fc_watch_add(
+        self,
+        event: AstrMessageEvent,
+        url: str = "",
+        minutes: str = "",
+        extra: GreedyStr = GreedyStr,
+    ):
+        """订阅页面变更检查（管理员）。"""
+        store = self.watch_store
+        host = self.watch_host
+        service = self.watch_service
+        if store is None or host is None or service is None or self._closing:
+            return event.plain_result(_RUNTIME_UNAVAILABLE)
+        umo = getattr(event, "unified_msg_origin", "")
+        if not umo:
+            return event.plain_result(_WATCH_NO_UMO_TEXT)
+        if not url or not minutes or extra is not GreedyStr:
+            return event.plain_result(_WATCH_ADD_USAGE_TEXT)
+        try:
+            interval = int(minutes)
+        except ValueError:
+            return event.plain_result(_WATCH_ADD_USAGE_TEXT)
+        tag = f"fcwatch-{uuid.uuid4().hex}"
+        try:
+            service.build_request(url, tag)
+        except ValueError as err:
+            return event.plain_result(f"订阅失败：{err}")
+        try:
+            record = await store.create(
+                umo=umo, url=url, interval_minutes=interval, tag=tag
+            )
+        except ValueError as err:
+            return event.plain_result(f"订阅失败：{err}")
+        try:
+            await host.start(record.id)
+        except Exception as exc:
+            logger.warning("watch cron 创建失败：%s", type(exc).__name__)
+            await store.delete(record.id)
+            return event.plain_result("订阅失败：定时任务不可用，已回滚订阅。")
+        return event.plain_result(
+            f"已订阅页面变更检查：\n{record.url}\n订阅ID：{record.id}\n"
+            f"每 {interval} 分钟检查一次，首次检查将在下一分钟执行。"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @fc_watch.command("list")
+    async def fc_watch_list(
+        self, event: AstrMessageEvent, extra: GreedyStr = GreedyStr
+    ):
+        """查看当前会话的页面变更订阅（管理员）。"""
+        store = self.watch_store
+        if store is None or self._closing:
+            return event.plain_result(_RUNTIME_UNAVAILABLE)
+        umo = getattr(event, "unified_msg_origin", "")
+        if not umo:
+            return event.plain_result(_WATCH_NO_UMO_TEXT)
+        if extra is not GreedyStr:
+            return event.plain_result(_WATCH_LIST_USAGE_TEXT)
+        subs = [s for s in await store.list_all() if s.umo == umo]
+        if not subs:
+            return event.plain_result("当前会话没有页面变更订阅。")
+        lines = [f"当前会话共 {len(subs)} 个页面变更订阅："]
+        for sub in subs:
+            lines.append(
+                f"- {sub.id} | {sub.url} | 每 {sub.interval_minutes} 分钟"
+                f" | 上次 {sub.last_status or '未检查'}"
+                f" | job {_short_job(sub.cron_job_id)}"
+            )
+        return event.plain_result(_truncate("\n".join(lines)))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @fc_watch.command("remove")
+    async def fc_watch_remove(
+        self,
+        event: AstrMessageEvent,
+        subscription_id: str = "",
+        extra: GreedyStr = GreedyStr,
+    ):
+        """删除当前会话的页面变更订阅（管理员）。"""
+        store = self.watch_store
+        host = self.watch_host
+        if store is None or host is None or self._closing:
+            return event.plain_result(_RUNTIME_UNAVAILABLE)
+        umo = getattr(event, "unified_msg_origin", "")
+        if not umo:
+            return event.plain_result(_WATCH_NO_UMO_TEXT)
+        if not subscription_id or extra is not GreedyStr:
+            return event.plain_result(_WATCH_ID_USAGE_TEXT)
+        try:
+            sub = await store.get(subscription_id)
+        except KeyError:
+            sub = None
+        if sub is None or sub.umo != umo:
+            return event.plain_result(_WATCH_NOT_FOUND_TEXT)
+        removed = await host.remove_subscription(sub.id)
+        if not removed:
+            logger.warning("watch 订阅调度删除失败：%s", sub.id)
+            return event.plain_result(_WATCH_REMOVE_FAILED_TEXT)
+        await store.delete(sub.id)
+        return event.plain_result(f"已删除订阅：{sub.url}（{sub.id}）。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @fc_watch.command("check")
+    async def fc_watch_check(
+        self,
+        event: AstrMessageEvent,
+        subscription_id: str = "",
+        extra: GreedyStr = GreedyStr,
+    ):
+        """立即检查当前会话的订阅并推送变更（管理员）。"""
+        store = self.watch_store
+        service = self.watch_service
+        if store is None or service is None or self._closing:
+            return event.plain_result(_RUNTIME_UNAVAILABLE)
+        umo = getattr(event, "unified_msg_origin", "")
+        if not umo:
+            return event.plain_result(_WATCH_NO_UMO_TEXT)
+        if not subscription_id or extra is not GreedyStr:
+            return event.plain_result(_WATCH_ID_USAGE_TEXT)
+        try:
+            sub = await store.get(subscription_id)
+        except KeyError:
+            sub = None
+        if sub is None or sub.umo != umo:
+            return event.plain_result(_WATCH_NOT_FOUND_TEXT)
+        return event.plain_result(_truncate(await service.check_now(sub.id)))
