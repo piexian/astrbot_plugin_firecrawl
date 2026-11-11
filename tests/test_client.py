@@ -7,6 +7,8 @@ import json
 
 import httpx
 import pytest
+from astrbot_plugin_firecrawl.firecrawl_api.budget import ReservationState
+from astrbot_plugin_firecrawl.persistence import SQLiteStore
 
 from firecrawl_api import (
     ErrorCategory,
@@ -14,11 +16,14 @@ from firecrawl_api import (
     FirecrawlError,
     KeyPool,
 )
+from firecrawl_api.client import KEY_REF_EXTENSION
+from firecrawl_api.keys import key_reference
 
 K1 = "fc-aaaaaaaa1111"
 K2 = "fc-bbbbbbbb2222"
 K3 = "fc-cccccccc3333"
 K4 = "fc-dddddddd4444"
+FP = "b" * 64
 
 
 def sha_ref(key: str) -> str:
@@ -540,3 +545,320 @@ def test_base_url_with_v2_suffix_rejected(base_url):
     with pytest.raises(FirecrawlError) as exc_info:
         FirecrawlClient(KeyPool([K1]), base_url=base_url)
     assert exc_info.value.category is ErrorCategory.CONFIG
+
+
+@pytest.mark.asyncio
+async def test_pinned_key_sends_exact_key_without_touching_cursor():
+    client, _, requests = make_client([K1, K2], [ok(), ok()])
+    response = await client.request("POST", "/scrape", key_ref=key_reference(K2))
+    assert requests[0].headers["authorization"] == f"Bearer {K2}"
+    assert response.extensions[KEY_REF_EXTENSION] == key_reference(K2)
+    await client.request("POST", "/scrape")
+    assert requests[1].headers["authorization"] == f"Bearer {K1}"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_pinned_cooled_key_is_still_tried_and_clears_on_success():
+    client, pool, requests = make_client([K1, K2], [ok()])
+    await pool.mark_failure(
+        K2, FirecrawlError(ErrorCategory.RATE_LIMIT, "限流", retry_after=60)
+    )
+    assert pool.summary()["keys"][1]["cooling"]
+    response = await client.request("POST", "/scrape", key_ref=key_reference(K2))
+    assert requests[0].headers["authorization"] == f"Bearer {K2}"
+    assert not pool.summary()["keys"][1]["cooling"]
+    assert response.extensions[KEY_REF_EXTENSION] == key_reference(K2)
+    await client.aclose()
+
+
+def bad_key() -> httpx.Response:
+    return httpx.Response(401, json={"error": "bad key"})
+
+
+def no_credits() -> httpx.Response:
+    return httpx.Response(402, json={"error": "no credits"})
+
+
+def no_permission() -> httpx.Response:
+    return httpx.Response(
+        403,
+        json={
+            "success": False,
+            "error": "Invalid API key",
+            "code": "INSUFFICIENT_PERMISSIONS",
+        },
+    )
+
+
+def slow_down() -> httpx.Response:
+    return httpx.Response(
+        429, json={"error": "slow down"}, headers={"Retry-After": "5"}
+    )
+
+
+@pytest.mark.parametrize(
+    ("respond", "category", "reason"),
+    [
+        (bad_key, ErrorCategory.AUTH, "auth"),
+        (no_credits, ErrorCategory.QUOTA, "quota"),
+        (no_permission, ErrorCategory.AUTH, "auth"),
+        (slow_down, ErrorCategory.RATE_LIMIT, "rate_limit"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_pinned_key_fails_fast_without_rotation(respond, category, reason):
+    client, pool, requests = make_client([K1, K2], [respond()])
+    with pytest.raises(FirecrawlError) as exc_info:
+        await client.request("POST", "/scrape", key_ref=key_reference(K2))
+    error = exc_info.value
+    assert error.category is category
+    assert len(requests) == 1
+    assert requests[0].headers["authorization"] == f"Bearer {K2}"
+    summary = pool.summary()["keys"]
+    assert summary[1]["cooling"] and summary[1]["cooldown_reason"] == reason
+    assert not summary[0]["cooling"]
+    await client.aclose()
+
+
+@pytest.mark.parametrize(
+    "key_ref",
+    [
+        "0" * 64,
+        "abc123",
+        key_reference(K1).upper(),
+        "",
+        123,
+    ],
+)
+@pytest.mark.asyncio
+async def test_invalid_key_ref_rejected_without_network_or_echo(key_ref):
+    client, _, requests = make_client([K1, K2], [])
+    with pytest.raises(FirecrawlError) as exc_info:
+        await client.request("POST", "/scrape", key_ref=key_ref)
+    error = exc_info.value
+    assert error.category is ErrorCategory.CONFIG
+    assert requests == []
+    text = str(error)
+    ref_text = str(key_ref)
+    if ref_text:
+        assert ref_text not in text
+    assert K1 not in text and K2 not in text
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_pinned_ref_on_empty_pool_rejected_without_network():
+    client, _, requests = make_client([], [])
+    with pytest.raises(FirecrawlError) as exc_info:
+        await client.request("POST", "/scrape", key_ref=key_reference(K1))
+    assert exc_info.value.category is ErrorCategory.CONFIG
+    assert requests == []
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_rotation_success_reports_final_actual_key_summary():
+    responses = [
+        unauthorized(),
+        httpx.Response(402, json={"error": "no credits"}),
+        ok(),
+    ]
+    client, _, requests = make_client([K1, K2, K3], responses)
+    response = await client.request("POST", "/scrape")
+    assert requests[2].headers["authorization"] == f"Bearer {K3}"
+    assert response.extensions[KEY_REF_EXTENSION] == key_reference(K3)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_anonymous_success_extension_is_none_without_authorization():
+    client, _, requests = make_client([], [ok()])
+    response = await client.request("POST", "/scrape")
+    assert response.extensions[KEY_REF_EXTENSION] is None
+    assert "authorization" not in requests[0].headers
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_success_keeps_response_and_other_extensions_without_key_leak():
+    served = ok()
+    served.extensions["transport.custom"] = "keep"
+    client, _, requests = make_client([K2], [served])
+    response = await client.request("POST", "/scrape")
+    assert isinstance(response, httpx.Response)
+    assert json.loads(response.content) == {"success": True}
+    assert response.request is requests[0]
+    assert response.extensions["transport.custom"] == "keep"
+    assert response.extensions[KEY_REF_EXTENSION] == key_reference(K2)
+    assert K2 not in str(response.extensions)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_before_send_persists_submitting_across_rotation(tmp_path):
+    store = SQLiteStore(tmp_path / "budget.db")
+    await store.initialize()
+    await store.reserve(5, kind="scrape", request_fingerprint=FP, reservation_id="r-1")
+    calls: list[tuple[str | None, bool]] = []
+    order: list[str] = []
+
+    async def on_send(ref, confirmed):
+        calls.append((ref, confirmed))
+        order.append("callback")
+        await store.mark_submitting(
+            "r-1", key_ref=ref, confirmed_not_accepted=confirmed
+        )
+
+    queue = [bad_key(), no_credits(), ok()]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        record = await store.get("r-1")
+        actual = request.headers["authorization"].removeprefix("Bearer ")
+        assert record.state is ReservationState.SUBMITTING
+        assert record.key_ref == key_reference(actual)
+        order.append("transport")
+        return queue.pop(0)
+
+    client = FirecrawlClient(
+        KeyPool([K1, K2, K3]), transport=httpx.MockTransport(handler)
+    )
+    response = await client.request(
+        "POST", "/scrape", json={"url": "https://example.com"}, before_send=on_send
+    )
+    await client.aclose()
+    assert response.status_code == 200
+    assert order == ["callback", "transport"] * 3
+    assert calls == [
+        (key_reference(K1), False),
+        (key_reference(K2), True),
+        (key_reference(K3), True),
+    ]
+    assert response.extensions[KEY_REF_EXTENSION] == key_reference(K3)
+    record = await store.get("r-1")
+    assert record.state is ReservationState.SUBMITTING
+    assert record.key_ref == key_reference(K3)
+    snapshot = await store.usage()
+    assert snapshot.active_reserved == 5.0
+    assert snapshot.used == 0.0
+    with pytest.raises(ValueError, match="预留 ID 已存在"):
+        await store.reserve(
+            5, kind="scrape", request_fingerprint=FP, reservation_id="r-1"
+        )
+    assert all(key not in str(calls) for key in (K1, K2, K3))
+
+
+@pytest.mark.asyncio
+async def test_first_before_send_failure_propagates_raw_without_network():
+    boom = httpx.ConnectError("callback boom")
+
+    async def on_send(ref, confirmed):
+        raise boom
+
+    transport, requests = make_transport([ok()])
+    client = FirecrawlClient(KeyPool([K1]), transport=transport)
+    with pytest.raises(httpx.ConnectError) as exc_info:
+        await client.request("POST", "/scrape", before_send=on_send)
+    assert exc_info.value is boom
+    assert requests == []
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_second_before_send_failure_stops_rotation_without_third_key():
+    boom = httpx.ConnectError("callback boom")
+    calls: list[tuple[str | None, bool]] = []
+
+    async def on_send(ref, confirmed):
+        calls.append((ref, confirmed))
+        if confirmed:
+            raise boom
+
+    transport, requests = make_transport([bad_key(), ok()])
+    client = FirecrawlClient(KeyPool([K1, K2, K3]), transport=transport)
+    with pytest.raises(httpx.ConnectError) as exc_info:
+        await client.request("POST", "/scrape", before_send=on_send)
+    assert exc_info.value is boom
+    assert calls == [
+        (key_reference(K1), False),
+        (key_reference(K2), True),
+    ]
+    assert len(requests) == 1
+    assert requests[0].headers["authorization"] == f"Bearer {K1}"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_construction_failure_skips_callback_and_network():
+    calls: list[tuple[str | None, bool]] = []
+
+    async def on_send(ref, confirmed):
+        calls.append((ref, confirmed))
+
+    client, _, requests = make_client([K1], [ok()])
+    with pytest.raises(TypeError):
+        await client.request(
+            "POST", "/scrape", json={"url": object()}, before_send=on_send
+        )
+    with pytest.raises(FirecrawlError) as exc_info:
+        await client.request("POST", "/scrape", key_ref="abc123", before_send=on_send)
+    assert exc_info.value.category is ErrorCategory.CONFIG
+    assert calls == []
+    assert requests == []
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_anonymous_before_send_receives_none_without_authorization():
+    calls: list[tuple[str | None, bool]] = []
+
+    async def on_send(ref, confirmed):
+        calls.append((ref, confirmed))
+
+    transport, requests = make_transport([ok()])
+    client = FirecrawlClient(KeyPool([]), transport=transport)
+    response = await client.request("POST", "/scrape", before_send=on_send)
+    assert calls == [(None, False)]
+    assert "authorization" not in requests[0].headers
+    assert response.extensions[KEY_REF_EXTENSION] is None
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_pinned_before_send_called_once_with_false():
+    calls: list[tuple[str | None, bool]] = []
+
+    async def on_send(ref, confirmed):
+        calls.append((ref, confirmed))
+
+    client, _, requests = make_client([K1, K2], [bad_key()])
+    with pytest.raises(FirecrawlError):
+        await client.request(
+            "POST", "/scrape", key_ref=key_reference(K2), before_send=on_send
+        )
+    assert calls == [(key_reference(K2), False)]
+    assert len(requests) == 1
+    await client.aclose()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        httpx.Response(500, json={"error": "boom"}),
+        httpx.ReadTimeout("too slow"),
+        httpx.ConnectError("refused"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_single_attempt_failures_call_before_send_once(failure):
+    calls: list[tuple[str | None, bool]] = []
+
+    async def on_send(ref, confirmed):
+        calls.append((ref, confirmed))
+
+    client, _, requests = make_client([K1, K2], [failure])
+    with pytest.raises(FirecrawlError):
+        await client.request("POST", "/scrape", before_send=on_send)
+    assert calls == [(key_reference(K1), False)]
+    assert len(requests) == 1
+    await client.aclose()

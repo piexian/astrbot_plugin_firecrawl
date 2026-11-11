@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import logging
+import hashlib
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
+
+from astrbot.api import logger as astrbot_logger
 
 from .errors import ErrorCategory, FirecrawlError
 
@@ -32,8 +34,13 @@ def _masked(key: str) -> str:
     return key[:4] + "***" if len(key) > 6 else "***"
 
 
+def key_reference(key: str) -> str:
+    """Key 的完整 SHA-256 摘要（64 位小写十六进制），用于提交与跨重启任务关联。"""
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
 class KeyPool:
-    """异步并发安全的 Key 池；纯 Python，不感知 AstrBot。"""
+    """异步并发安全的 Key 池；通过 AstrBot logger 记录去重警告。"""
 
     def __init__(
         self,
@@ -44,7 +51,7 @@ class KeyPool:
         logger: Any | None = None,
     ) -> None:
         self._clock = clock
-        self._logger = logger if logger is not None else logging.getLogger(__name__)
+        self._logger = logger if logger is not None else astrbot_logger
         self._cooldown_seconds = cooldown_seconds
         self._lock = asyncio.Lock()
         self._states: list[_KeyState] = []
@@ -71,6 +78,11 @@ class KeyPool:
     @property
     def key_count(self) -> int:
         return len(self._states)
+
+    @property
+    def key_refs(self) -> tuple[str, ...]:
+        """去重后配置顺序的 Key 摘要清单；不含完整 Key。"""
+        return tuple(key_reference(state.key) for state in self._states)
 
     async def acquire(self, attempted_keys: Iterable[str] | None = None) -> str:
         """取本次请求下一个未尝试的 Key。
@@ -142,6 +154,15 @@ class KeyPool:
             "duplicates_removed": self._duplicates,
             "keys": keys,
         }
+
+    def resolve(self, key_ref: str) -> str:
+        """按完整摘要只读查回当前配置中的原 Key；不动游标与冷却。"""
+        if not isinstance(key_ref, str):
+            raise ValueError("无法识别的 Key 摘要")
+        for state in self._states:
+            if key_reference(state.key) == key_ref:
+                return state.key
+        raise ValueError("无法识别的 Key 摘要")
 
     def _require(self, key: str) -> _KeyState:
         state = self._by_key.get(key)

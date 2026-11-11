@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 
 import pytest
@@ -13,6 +14,7 @@ from firecrawl_api import (
     KeyPool,
     KeyPoolExhausted,
 )
+from firecrawl_api.keys import key_reference
 
 K1 = "fc-aaaaaaaa1111"
 K2 = "fc-bbbbbbbb2222"
@@ -261,3 +263,85 @@ def test_duplicate_warning_survives_concurrent_acquire():
     picked = list(asyncio.run(gather_acquires(pool, 4)))
     assert set(picked) == {K1, K2}
     assert len(logs.records) == 1
+
+
+def test_key_reference_is_full_lowercase_sha256():
+    assert key_reference(K1) == hashlib.sha256(K1.encode("utf-8")).hexdigest()
+    assert len(key_reference(K1)) == 64
+    assert key_reference(K1) == key_reference(K1).lower()
+
+
+def test_key_reference_keeps_key_verbatim():
+    assert key_reference(f" {K1} ") != key_reference(K1)
+    assert key_reference("") == hashlib.sha256(b"").hexdigest()
+
+
+def test_same_prefix_keys_get_distinct_refs():
+    ka = "fc-aaaaaaaa1111"
+    kb = "fc-aaaaaaaa1112"
+    assert key_reference(ka) != key_reference(kb)
+    pool, _ = make_pool([ka, kb])
+    assert pool.resolve(key_reference(ka)) == ka
+    assert pool.resolve(key_reference(kb)) == kb
+
+
+def test_key_refs_unique_ordered_without_full_keys():
+    pool, _ = make_pool([f" {K1} ", K1, "", "   ", K2, K1, None])
+    refs = pool.key_refs
+    assert refs == (key_reference(K1), key_reference(K2))
+    assert len(set(refs)) == len(refs)
+    dumped = json.dumps(refs)
+    assert K1 not in dumped
+    assert K2 not in dumped
+
+
+def test_anonymous_pool_has_no_refs_and_resolves_nothing():
+    pool, _ = make_pool([])
+    assert pool.key_refs == ()
+    with pytest.raises(ValueError):
+        pool.resolve(key_reference(K1))
+
+
+def test_resolve_survives_rebuild_and_reorder():
+    refs = {key: key_reference(key) for key in (K1, K2, K3)}
+    first_pool, _ = make_pool([K1, K2, K3])
+    assert first_pool.resolve(refs[K2]) == K2
+    rebuilt, _ = make_pool([K3, K1])
+    assert rebuilt.resolve(refs[K3]) == K3
+    assert rebuilt.resolve(refs[K1]) == K1
+    with pytest.raises(ValueError):
+        rebuilt.resolve(refs[K2])
+
+
+@pytest.mark.asyncio
+async def test_resolve_keeps_cooldown_and_cursor_intact():
+    pool, clock = make_pool([K1, K2, K3])
+    refs_before = pool.key_refs
+    assert await pool.acquire() == K1
+    await pool.mark_failure(K3, rate_limit_error(retry_after=100))
+    assert pool.resolve(key_reference(K3)) == K3
+    cooled = pool.summary()["keys"][2]
+    assert cooled["cooling"] is True
+    assert cooled["cooldown_reason"] == "rate_limit"
+    assert cooled["cooldown_seconds_left"] == 100
+    assert await pool.acquire() == K2
+    assert pool.key_refs == refs_before
+    clock.advance(100)
+    assert pool.summary()["keys"][2]["cooling"] is False
+
+
+def test_resolve_rejects_bad_refs_with_fixed_error():
+    pool, _ = make_pool([K1])
+    ref = key_reference(K1)
+    bad_refs = [ref[:8], ref.upper(), "f" * 64, "", 123, None, b"fc", True]
+    messages = []
+    for bad_ref in bad_refs:
+        with pytest.raises(ValueError) as exc_info:
+            pool.resolve(bad_ref)
+        message = str(exc_info.value)
+        messages.append(message)
+        assert K1 not in message
+        assert ref not in message
+        if isinstance(bad_ref, str) and bad_ref:
+            assert bad_ref not in message
+    assert len(set(messages)) == 1

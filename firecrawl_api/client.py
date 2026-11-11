@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
-import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
+from astrbot.api import logger as astrbot_logger
 
 from .errors import (
     ErrorCategory,
@@ -16,7 +16,7 @@ from .errors import (
     classify_error,
     validate_classify_flags,
 )
-from .keys import KeyPool, KeyPoolExhausted
+from .keys import KeyPool, KeyPoolExhausted, key_reference
 
 _API_VERSION = "/v2"
 _DEFAULT_BASE_URL = "https://api.firecrawl.dev"
@@ -24,6 +24,13 @@ _DEFAULT_TIMEOUT_SECONDS = 60.0
 
 # Key 池为空时仍允许匿名的端点。
 _ANONYMOUS_ENDPOINTS = frozenset({("POST", "/scrape"), ("POST", "/search")})
+
+
+# 成功响应 extensions 中记录实际使用 Key 的 SHA-256 摘要。
+KEY_REF_EXTENSION = "firecrawl_key_ref"
+
+# 发送前异步持久化回调：参数为本次实际 Key 摘要（匿名 None）与 confirmed_not_accepted。
+BeforeSendCallback = Callable[[str | None, bool], Awaitable[None]]
 
 
 def _config_error(message: str) -> FirecrawlError:
@@ -105,7 +112,7 @@ class FirecrawlClient:
         self._base_url = _validate_base_url(base_url)
         self._timeout = float(timeout_seconds)
         self._pool = keys
-        self._logger = logger if logger is not None else logging.getLogger(__name__)
+        self._logger = logger if logger is not None else astrbot_logger
         self._owns_client = client is None
         if client is not None:
             self._client = client
@@ -122,27 +129,42 @@ class FirecrawlClient:
         headers: dict[str, str] | None = None,
         retryable_422: bool = False,
         credential_error: bool | None = None,
+        key_ref: str | None = None,
+        before_send: BeforeSendCallback | None = None,
     ) -> httpx.Response:
-        """发送 /v2 请求；2xx 返回 Response，全部 key 失败抛最后一次错误。"""
+        """发送 /v2 请求；2xx 返回 Response 并在 extensions 记录实际 Key 摘要；key_ref 指定时只尝试该 Key 一次；每次真实发送前 await before_send(Key摘要或None, confirmed_not_accepted)。"""
         validate_classify_flags(credential_error, retryable_422)
         _validate_endpoint(endpoint)
         url = f"{self._base_url}{_API_VERSION}{endpoint}"
         anonymous = self._pool.key_count == 0
+        pinned: str | None = None
+        if key_ref is not None:
+            try:
+                pinned = self._pool.resolve(key_ref)
+            except ValueError:
+                raise _config_error("无法识别的 Key 摘要，已拒绝发送请求。")
         if anonymous and (method.upper(), endpoint) not in _ANONYMOUS_ENDPOINTS:
             raise classify_error(exc=MissingKeyError())
 
         attempted: set[str] = set()
         last_error: FirecrawlError | None = None
+        confirmed = False
         while True:
             key = None
-            if not anonymous:
+            if pinned is not None:
+                key = pinned
+            elif not anonymous:
                 try:
                     key = await self._pool.acquire(attempted)
                 except KeyPoolExhausted:
                     break
                 attempted.add(key)
+            request = self._build_request(method, url, key, json, params, headers)
+            if before_send is not None:
+                ref = None if key is None else key_reference(key)
+                await before_send(ref, confirmed)
             try:
-                response = await self._send(method, url, key, json, params, headers)
+                response = await self._send(request)
             except httpx.RequestError as exc:
                 error = classify_error(exc=exc)
                 if key is not None:
@@ -152,6 +174,8 @@ class FirecrawlClient:
             if error is None:
                 if key is not None:
                     await self._pool.mark_success(key)
+                ref = None if key is None else key_reference(key)
+                response.extensions[KEY_REF_EXTENSION] = ref
                 return response
             if key is None:
                 raise error
@@ -160,6 +184,9 @@ class FirecrawlClient:
                 raise error
             last_error = error
             await self._pool.mark_failure(key, error)
+            if pinned is not None:
+                break
+            confirmed = True
         raise last_error
 
     async def aclose(self) -> None:
@@ -167,7 +194,7 @@ class FirecrawlClient:
         if self._owns_client:
             await self._client.aclose()
 
-    async def _send(
+    def _build_request(
         self,
         method: str,
         url: str,
@@ -175,8 +202,8 @@ class FirecrawlClient:
         json: Any,
         params: dict[str, Any] | None,
         headers: dict[str, str] | None,
-    ) -> httpx.Response:
-        """手动构造 Request 发送：统一剥离 Authorization，关闭注入认证与自动跳转。"""
+    ) -> httpx.Request:
+        """手动构造 Request：统一剥离 Authorization，注入唯一 Authorization 与超时。"""
         request_headers = httpx.Headers(dict(headers or {}))
         if "authorization" in request_headers:
             del request_headers["authorization"]
@@ -186,11 +213,15 @@ class FirecrawlClient:
             method, url, json=json, params=params, headers=request_headers
         )
         request.extensions["timeout"] = httpx.Timeout(self._timeout).as_dict()
+        return request
+
+    async def _send(self, request: httpx.Request) -> httpx.Response:
+        """唯一发送点：关闭注入认证与自动跳转。"""
         return await self._client.send(request, auth=None, follow_redirects=False)
 
     def _warn_failure(self, key: str, error: FirecrawlError) -> None:
         """每次失败写 warning：只含 key 的 SHA-256 引用、category 和 status。"""
-        ref = hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
+        ref = key_reference(key)[:8]
         status = error.status if error.status is not None else "transport"
         self._logger.warning(
             f"Firecrawl 请求失败：key=sha256:{ref} "

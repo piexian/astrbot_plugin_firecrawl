@@ -1,5 +1,5 @@
 name: astrbot_plugin_firecrawl
-display_name: Firecrawl网页抓取
+display_name: Firecrawl网络工具
 desc: 通过 Firecrawl API 进行网页抓取、搜索与站点任务。
 version: v0.1.0
 author: piexian

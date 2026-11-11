@@ -9,7 +9,7 @@ from enum import Enum
 
 from .errors import ErrorCategory, FirecrawlError
 
-# 本轮工具只开放这些 format；json、question 每页加价，summary 不加价。
+# 当前工具只开放这些 format；json、question 每页加价，summary 不加价。
 _PAGE_FORMATS = ("markdown", "summary", "links", "html", "question", "json")
 _SURCHARGE_FORMATS = ("question", "json")
 _SITE_KINDS = ("map", "crawl", "batch")
