@@ -19,6 +19,7 @@ from ..tools.result import fail
 from .core import (
     WatchCheckResult,
     WatchRequest,
+    append_watch_summary,
     build_watch_notification,
     build_watch_request,
     parse_watch_response,
@@ -83,7 +84,7 @@ class WatchService:
             return await self._run_check(sub)
 
     async def _run_check(self, sub: WatchSubscription) -> str:
-        """执行一次真实检查并推进周期；返回面向用户的单行结果。"""
+        """执行一次真实检查并推进周期；返回附带页面摘要的用户结果。"""
         try:
             request = self.build_request(sub.url, sub.tag)
         except Exception as exc:
@@ -123,8 +124,10 @@ class WatchService:
             return "检查完成但响应缺少有效变更跟踪数据，已顺延下次检查。"
         await self._advance(sub.id, result.status)
         if result.status == "changed":
-            return await self._notify_changed(sub.id, result)
-        return _STATUS_TEXTS[result.status]
+            text = await self._notify_changed(sub.id, result)
+        else:
+            text = _STATUS_TEXTS[result.status]
+        return append_watch_summary(text, result.summary)
 
     async def _advance(self, subscription_id: str, status: str | None) -> None:
         """记录本次检查状态并按周期推进 next_check_at，失败记录日志。"""

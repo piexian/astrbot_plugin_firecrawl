@@ -61,8 +61,13 @@ async def test_initialize_is_idempotent_and_sets_version(tmp_path):
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
     }
     conn.close()
-    assert version == 2
-    assert {"daily_usage", "reservations", "watch_subscriptions"} <= tables
+    assert version == 3
+    assert {
+        "daily_usage",
+        "reservations",
+        "watch_subscriptions",
+        "agent_tasks",
+    } <= tables
 
 
 @pytest.mark.asyncio
@@ -70,7 +75,7 @@ async def test_initialize_rejects_newer_schema_version(tmp_path):
     path = tmp_path / "budget.db"
     await make_store(path).initialize()
     conn = sqlite3.connect(path)
-    conn.execute("PRAGMA user_version = 3")
+    conn.execute("PRAGMA user_version = 4")
     conn.commit()
     conn.close()
     with pytest.raises(ValueError, match="schema 版本"):
@@ -82,13 +87,13 @@ async def test_initialize_reject_keeps_version_and_journal_mode(tmp_path):
     path = tmp_path / "budget.db"
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA journal_mode=DELETE")
-    conn.execute("PRAGMA user_version = 3")
+    conn.execute("PRAGMA user_version = 4")
     conn.commit()
     conn.close()
     with pytest.raises(ValueError, match="schema 版本"):
         await make_store(path).initialize()
     conn = sqlite3.connect(path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
     assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
     conn.close()
 
@@ -918,11 +923,54 @@ async def test_watch_migration_upgrades_v1_and_preserves_budget_data(tmp_path):
         "SELECT used FROM daily_usage WHERE utc_day = ?", (_DAY,)
     ).fetchone()
     conn.close()
-    assert version == 2
-    assert "watch_subscriptions" in tables
+    assert version == 3
+    assert {"watch_subscriptions", "agent_tasks"} <= tables
     assert kept == ("r-old", "settled", 4.0)
     assert used == (4.0,)
     await store.initialize()
+
+
+@pytest.mark.asyncio
+async def test_agent_migration_upgrades_v2_and_preserves_existing_data(tmp_path):
+    path = tmp_path / "v2.db"
+    budget = make_store(path)
+    await budget.initialize()
+    reservation = await budget.reserve(
+        4, kind="scrape", request_fingerprint=fp(8), reservation_id="r-v2"
+    )
+    await budget.mark_submitting(reservation.reservation_id)
+    await budget.accept(reservation.reservation_id)
+    await budget.settle(reservation.reservation_id, 4)
+    watch = make_watch_store(path)
+    await watch.create(
+        umo="u-v2", url="https://example.com/v2", interval_minutes=5, tag="v2-tag"
+    )
+
+    conn = sqlite3.connect(path)
+    conn.execute("DROP TABLE agent_tasks")
+    conn.execute("PRAGMA user_version = 2")
+    conn.commit()
+    conn.close()
+
+    await watch.initialize()
+    conn = sqlite3.connect(path)
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    tables = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    kept_reservation = conn.execute(
+        "SELECT state, accounted_credits FROM reservations WHERE reservation_id = 'r-v2'"
+    ).fetchone()
+    kept_watch = conn.execute(
+        "SELECT umo, tag FROM watch_subscriptions WHERE tag = 'v2-tag'"
+    ).fetchone()
+    conn.close()
+
+    assert version == 3
+    assert "agent_tasks" in tables
+    assert kept_reservation == ("settled", 4.0)
+    assert kept_watch == ("u-v2", "v2-tag")
 
 
 @pytest.mark.asyncio

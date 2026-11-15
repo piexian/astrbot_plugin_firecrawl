@@ -53,7 +53,12 @@ def ok(data: Any) -> str:
     return json.dumps({"ok": True, "data": data}, ensure_ascii=False, allow_nan=False)
 
 
-def fail(error: BaseException, *, example: dict[str, Any] | None = None) -> str:
+def fail(
+    error: BaseException,
+    *,
+    example: dict[str, Any] | None = None,
+    hint: str | None = None,
+) -> str:
     """把异常收敛为固定字段 JSON，usage 类别附加静态示例；非 Exception 原样上抛。"""
     if not isinstance(error, Exception):
         raise error
@@ -70,6 +75,8 @@ def fail(error: BaseException, *, example: dict[str, Any] | None = None) -> str:
         payload = _server()
     if payload["category"] == "usage" and example is not None:
         payload["example"] = example
+    if hint is not None:
+        payload["hint"] = hint
     return json.dumps(payload, ensure_ascii=False, allow_nan=False)
 
 

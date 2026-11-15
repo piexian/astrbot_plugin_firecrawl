@@ -14,6 +14,8 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.star.filter.command import GreedyStr
 
+from .agent.service import AgentService
+from .agent.store import AgentStore
 from .firecrawl_api.budget import BudgetPolicy
 from .firecrawl_api.client import FirecrawlClient
 from .firecrawl_api.errors import (
@@ -24,7 +26,9 @@ from .firecrawl_api.errors import (
 )
 from .firecrawl_api.keys import KeyPool
 from .persistence import SQLiteStore, WatchStore
+from .tools.agent import FirecrawlAgentTool
 from .tools.execution import BudgetedExecutor
+from .tools.parse import FirecrawlParseTool
 from .tools.scrape import FirecrawlScrapeTool
 from .tools.search import FirecrawlSearchTool
 from .tools.site import FirecrawlSiteTool
@@ -50,6 +54,7 @@ _PENDING_USAGE_TEXT = (
     "用法：/fc pending list 或 /fc pending resolve <预留ID> <实际credits>。"
 )
 _PENDING_READ_FAILED_TEXT = "读取本地预算数据失败，请稍后重试。"
+_PENDING_NO_JOB_HINT = "无远端任务 ID 的记录无法自动查询。本地账目未决，请先核对 Firecrawl 任务/账单，确认未受理后才可用 0 释放。"
 _RESOLVE_USAGE_TEXT = (
     "用法：/fc pending resolve <预留ID> <实际credits>；"
     "实际 credits 为非负有限小数，0 表示确认未受理。"
@@ -216,9 +221,11 @@ class FirecrawlPlugin(Star):
         self.watch_store: WatchStore | None = None
         self.watch_service: WatchService | None = None
         self.watch_host: WatchHost | None = None
+        self.agent_store: AgentStore | None = None
+        self.agent_service: AgentService | None = None
 
     async def initialize(self) -> None:
-        """装配运行时：预算存储、恢复、Key 池、客户端与工具注册，失败即回滚。"""
+        """装配运行时：预算存储、恢复、Key 池、客户端、Agent 服务、工具注册与 watch，失败即回滚。"""
         if self.executor is not None:
             return
         self._closing = False
@@ -255,10 +262,22 @@ class FirecrawlPlugin(Star):
             if concurrency < 1:
                 raise ValueError("max_concurrent_requests 必须至少为 1。")
             self._semaphore = asyncio.Semaphore(concurrency)
+            agent_store = AgentStore(data_dir / _DB_FILENAME)
+            await agent_store.initialize()
+            self.agent_store = agent_store
+            agent_service = AgentService(self, agent_store)
+            self.agent_service = agent_service
             self.context.add_llm_tools(
                 FirecrawlSearchTool(plugin=self),
-                FirecrawlScrapeTool(plugin=self),
+                FirecrawlScrapeTool(plugin=self, data_dir=data_dir),
+                FirecrawlParseTool(plugin=self),
+                FirecrawlAgentTool(plugin=self),
                 FirecrawlSiteTool(plugin=self),
+            )
+            recovered = await agent_service.recover()
+            logger.info(
+                f"Firecrawl Agent 恢复完成：processing {recovered['processing']}，"
+                f"未通知终态 {recovered['unnotified']}。"
             )
             watch_store = WatchStore(data_dir / _DB_FILENAME)
             await watch_store.initialize()
@@ -273,6 +292,12 @@ class FirecrawlPlugin(Star):
                     await host.stop()
                 except BaseException as exc:
                     logger.warning("watch 调度清理失败：%s", type(exc).__name__)
+            service = self.agent_service
+            if service is not None:
+                try:
+                    await service.close()
+                except BaseException as exc:
+                    logger.warning("agent 服务关闭失败：%s", type(exc).__name__)
             if client is not None:
                 await client.aclose()
             self._release_runtime()
@@ -280,7 +305,7 @@ class FirecrawlPlugin(Star):
             raise
 
     async def terminate(self) -> None:
-        """关闭运行时：先停 watch 调度，等待在途请求排空后关闭客户端；可重复调用。"""
+        """关闭运行时：先停 watch 调度，再关闭 Agent 服务（不向远端发送 DELETE），等待在途请求排空后关闭客户端；可重复调用。"""
         self._closing = True
         if self._terminated:
             return
@@ -288,6 +313,9 @@ class FirecrawlPlugin(Star):
         host = self.watch_host
         if host is not None:
             await host.stop()
+        service = self.agent_service
+        if service is not None:
+            await service.close()
         await self._drained.wait()
         client = self.client
         if client is not None:
@@ -324,6 +352,8 @@ class FirecrawlPlugin(Star):
         self.watch_store = None
         self.watch_service = None
         self.watch_host = None
+        self.agent_store = None
+        self.agent_service = None
         self._semaphore = None
         self._active_scopes = set()
         self._drained = asyncio.Event()
@@ -427,7 +457,7 @@ class FirecrawlPlugin(Star):
         )
 
     async def _pending_list_text(self, store: SQLiteStore) -> str:
-        """输出本地待决预留短摘要与 UTC 用量，绝不输出指纹与完整 Key。"""
+        """输出本地待决预留短摘要与 UTC 用量；无远端 job_id 时附加人工核对提示。"""
         try:
             pending = await store.list_pending()
             snapshot = await store.usage()
@@ -451,6 +481,8 @@ class FirecrawlPlugin(Star):
         hidden = len(pending) - _PENDING_LIST_LIMIT
         if hidden > 0:
             lines.append(f"… 其余 {hidden} 笔已省略。")
+        if any(record.job_id is None for record in pending):
+            lines.append(_PENDING_NO_JOB_HINT)
         return "\n".join(lines)
 
     async def _resolve_text(self, store: SQLiteStore, args: list[str]) -> str:

@@ -6,7 +6,7 @@ import copy
 
 import pytest
 
-from firecrawl_api import budget
+from firecrawl_api import budget, tasks
 from firecrawl_api.budget import estimate_site
 from firecrawl_api.site import (
     build_batch_payload,
@@ -289,6 +289,20 @@ def test_task_id_allows_uuid_and_ascii_jobs():
         assert request["job_id"] == valid
         args = normalize_site_args("status", job_id=valid, kind="crawl")
         assert args["job_id"] == valid
+
+
+def test_site_task_handle_rejects_agent_kind():
+    with pytest.raises(ValueError):
+        make_task_handle("agent", "job-1", KEY_REF)
+    with pytest.raises(ValueError):
+        parse_task_handle(f"agent:job-1@{KEY_REF}")
+
+
+def test_site_task_handle_matches_shared_implementation():
+    for kind in ("crawl", "batch"):
+        handle = make_task_handle(kind, "job-123", KEY_REF)
+        assert handle == tasks.make_task_handle(kind, "job-123", KEY_REF)
+        assert parse_task_handle(handle) == tasks.parse_task_handle(handle)
 
 
 def test_estimate_site_credits_reuses_budget_estimate_site():

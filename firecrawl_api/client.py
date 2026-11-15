@@ -125,6 +125,8 @@ class FirecrawlClient:
         endpoint: str,
         *,
         json: Any = None,
+        data: Any = None,
+        files: Any = None,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         retryable_422: bool = False,
@@ -159,7 +161,9 @@ class FirecrawlClient:
                 except KeyPoolExhausted:
                     break
                 attempted.add(key)
-            request = self._build_request(method, url, key, json, params, headers)
+            request = self._build_request(
+                method, url, key, json, data, files, params, headers
+            )
             if before_send is not None:
                 ref = None if key is None else key_reference(key)
                 await before_send(ref, confirmed)
@@ -200,6 +204,8 @@ class FirecrawlClient:
         url: str,
         key: str | None,
         json: Any,
+        data: Any,
+        files: Any,
         params: dict[str, Any] | None,
         headers: dict[str, str] | None,
     ) -> httpx.Request:
@@ -210,7 +216,13 @@ class FirecrawlClient:
         if key is not None:
             request_headers["Authorization"] = f"Bearer {key}"
         request = httpx.Request(
-            method, url, json=json, params=params, headers=request_headers
+            method,
+            url,
+            json=json,
+            data=data,
+            files=files,
+            params=params,
+            headers=request_headers,
         )
         request.extensions["timeout"] = httpx.Timeout(self._timeout).as_dict()
         return request

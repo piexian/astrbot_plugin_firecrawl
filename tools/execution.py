@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import mimetypes
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -12,14 +14,14 @@ import httpx
 from ..firecrawl_api.budget import Reservation
 from ..firecrawl_api.client import KEY_REF_EXTENSION, FirecrawlClient
 from ..firecrawl_api.errors import FirecrawlError
-from ..firecrawl_api.site import make_task_handle, parse_task_handle
+from ..firecrawl_api.tasks import make_task_handle, parse_task_handle
 from ..persistence import SQLiteStore
 
 # 本执行器支持的同步 kind 到固定 POST 端点。
 _ENDPOINTS = {"search": "/search", "scrape": "/scrape", "map": "/map"}
 
 # 本执行器支持的异步提交 kind 到固定 POST 端点。
-_SUBMIT_ENDPOINTS = {"crawl": "/crawl", "batch": "/batch/scrape"}
+_SUBMIT_ENDPOINTS = {"crawl": "/crawl", "batch": "/batch/scrape", "agent": "/agent"}
 
 # 任务句柄操作到固定 HTTP 方法：status 用 GET，cancel 用 DELETE。
 _TASK_METHODS = {"status": "GET", "cancel": "DELETE"}
@@ -55,13 +57,8 @@ def _fingerprint(kind: str, endpoint: str, payload: dict) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _actual_credits(body: Any, estimate: int) -> float:
-    """读取成功响应顶层 creditsUsed，字段缺省按预估，错误值抛 ValueError。"""
-    if not isinstance(body, dict):
-        raise ValueError("成功响应体必须是 JSON 对象")
-    if "creditsUsed" not in body:
-        return float(estimate)
-    value = body["creditsUsed"]
+def _finite_credits(value: Any) -> float:
+    """creditsUsed 值必须是非 bool 的有限非负数字，坏值抛 ValueError。"""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError("creditsUsed 必须是数字")
     try:
@@ -71,6 +68,50 @@ def _actual_credits(body: Any, estimate: int) -> float:
     if not math.isfinite(value) or value < 0:
         raise ValueError("creditsUsed 必须是有限非负数")
     return value
+
+
+def _actual_credits(body: Any, estimate: int) -> float:
+    """读取成功响应顶层 creditsUsed，字段缺省按预估，错误值抛 ValueError。"""
+    if not isinstance(body, dict):
+        raise ValueError("成功响应体必须是 JSON 对象")
+    if "creditsUsed" not in body:
+        return float(estimate)
+    return _finite_credits(body["creditsUsed"])
+
+
+def _parse_actual_credits(body: Any, estimate: int) -> float:
+    """parse 费用：顶层 creditsUsed 优先，其次 data.metadata.creditsUsed，缺省按预估。"""
+    if not isinstance(body, dict):
+        raise ValueError("成功响应体必须是 JSON 对象")
+    if "creditsUsed" in body:
+        return _finite_credits(body["creditsUsed"])
+    data = body.get("data")
+    if not isinstance(data, dict):
+        raise ValueError("parse 响应缺少 data 对象")
+    metadata = data.get("metadata")
+    if metadata is None:
+        return float(estimate)
+    if not isinstance(metadata, dict):
+        raise ValueError("data.metadata 必须是对象")
+    if "creditsUsed" not in metadata:
+        return float(estimate)
+    return _finite_credits(metadata["creditsUsed"])
+
+
+def _canonical_options(options: dict) -> str:
+    """options 的规范 JSON 字符串：排序键、紧凑分隔符，供 multipart data.options。"""
+    return json.dumps(
+        options,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
+def _file_content_type(filename: str) -> str:
+    """按扩展名推断文件 Content-Type，未知类型回退 application/octet-stream。"""
+    return mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
 
 def _task_status_body(response: httpx.Response) -> dict:
@@ -117,14 +158,57 @@ class BudgetedExecutor:
 
         return response
 
+    async def execute_parse(
+        self, *, filename: str, content: bytes, options: dict, estimate: int
+    ) -> httpx.Response:
+        """以固定 POST /parse 上传单文件，返回原始响应并按实际费用结算。"""
+        fingerprint_payload = {
+            "filename": filename,
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "options": options,
+        }
+        request_kwargs = {
+            "data": {"options": _canonical_options(options)},
+            "files": [("file", (filename, content, _file_content_type(filename)))],
+        }
+        response, rid = await self._send_budgeted(
+            "parse",
+            "/parse",
+            fingerprint_payload,
+            estimate,
+            request_kwargs=request_kwargs,
+        )
+
+        try:
+            actual = _parse_actual_credits(response.json(), estimate)
+        except ValueError as exc:
+            await self._store.mark_indeterminate(rid)
+            raise PendingRequestError(rid) from exc
+
+        try:
+            await self._store.accept(rid)
+            await self._store.settle(rid, actual)
+        except Exception as exc:
+            # 写库中断：保留数据库真实状态，交由 recover 与管理员收敛。
+            raise PendingRequestError(rid) from exc
+
+        return response
+
     async def submit(
-        self, kind: str, payload: dict, *, estimate: int
+        self,
+        kind: str,
+        payload: dict,
+        *,
+        estimate: int,
+        after_reserve: Callable[[Reservation], Awaitable[None]] | None = None,
     ) -> tuple[httpx.Response, Reservation]:
-        """提交 crawl/batch 异步任务，返回原始响应与 accepted 预留，本次不结算费用。"""
+        """提交 crawl/batch/agent 异步任务，返回原始响应与 accepted 预留，本次不结算费用。"""
         endpoint = _SUBMIT_ENDPOINTS.get(kind)
         if endpoint is None:
-            raise ValueError("不支持的 kind，仅支持 crawl、batch。")
-        response, rid = await self._send_budgeted(kind, endpoint, payload, estimate)
+            raise ValueError("不支持的 kind，仅支持 crawl、batch、agent。")
+        response, rid = await self._send_budgeted(
+            kind, endpoint, payload, estimate, after_reserve=after_reserve
+        )
 
         try:
             body = response.json()
@@ -195,9 +279,18 @@ class BudgetedExecutor:
         return await self._client.request(method, endpoint, key_ref=parsed["key_ref"])
 
     async def _send_budgeted(
-        self, kind: str, endpoint: str, payload: dict, estimate: int
+        self,
+        kind: str,
+        endpoint: str,
+        payload: dict,
+        estimate: int,
+        *,
+        request_kwargs: dict | None = None,
+        after_reserve: Callable[[Reservation], Awaitable[None]] | None = None,
     ) -> tuple[httpx.Response, str]:
-        """预留→发送前落账→发送→失败分流，返回原始响应与预留 ID。"""
+        """预留→after_reserve 回调→发送前落账→发送→失败分流；payload 仅作指纹，request_kwargs 缺省 json=payload。"""
+        if request_kwargs is None:
+            request_kwargs = {"json": payload}
         fingerprint = _fingerprint(kind, endpoint, payload)
         reservation = await self._store.reserve(
             estimate, kind=kind, request_fingerprint=fingerprint
@@ -219,9 +312,17 @@ class BudgetedExecutor:
             )
             submitting = True
 
+        if after_reserve is not None:
+            try:
+                await after_reserve(reservation)
+            except BaseException:
+                # 回调失败尚未发送：确认未受理，释放预留后原样抛出。
+                await self._store.release(rid, confirmed_not_accepted=True)
+                raise
+
         try:
             response = await self._client.request(
-                "POST", endpoint, json=payload, before_send=before_send
+                "POST", endpoint, before_send=before_send, **request_kwargs
             )
         except Exception as exc:
             if not entered:

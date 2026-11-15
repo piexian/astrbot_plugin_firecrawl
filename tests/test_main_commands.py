@@ -673,6 +673,84 @@ async def test_pending_list_masks_fingerprint_key_and_job_id(main_sdk, tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_pending_list_hints_when_job_id_missing_and_keeps_pending(
+    main_sdk, tmp_path
+):
+    module = main_sdk.module
+    plugin = await _wired_plugin(main_sdk, tmp_path, keys=(K1,))
+    store = plugin.store
+    try:
+        rid_reserved = await _seed(store, estimate=2, kind="search", fingerprint=FP2)
+        rid_indeterminate = await _seed(
+            store,
+            estimate=4,
+            kind="scrape",
+            fingerprint=FP1,
+            key_ref=ref_of(K1),
+        )
+        await store.mark_indeterminate(rid_indeterminate)
+        output = await _run(plugin, "fc pending list", admin=True)
+        assert module._PENDING_NO_JOB_HINT in output
+        assert "未扣费" not in output
+        assert rid_reserved in output and rid_indeterminate in output
+        assert "reserved" in output and "indeterminate" in output
+        assert "| job -" in output
+        assert f"sha256:{ref_of(K1)[:8]}" in output
+        assert ref_of(K1) not in output
+        assert FP1 not in output and FP2 not in output
+        assert K1 not in output
+        pending = await store.list_pending()
+        by_id = {record.reservation_id: record for record in pending}
+        assert set(by_id) == {rid_reserved, rid_indeterminate}
+        assert by_id[rid_reserved].state.value == "reserved"
+        assert by_id[rid_reserved].job_id is None
+        assert by_id[rid_indeterminate].state.value == "indeterminate"
+        assert by_id[rid_indeterminate].job_id is None
+        assert by_id[rid_indeterminate].actual_credits is None
+        assert by_id[rid_indeterminate].accounted_credits == 0
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_pending_list_omits_hint_when_empty_or_all_have_job_id(
+    main_sdk, tmp_path
+):
+    module = main_sdk.module
+    plugin = await _wired_plugin(main_sdk, tmp_path, keys=(K1,))
+    store = plugin.store
+    try:
+        empty = await _run(plugin, "fc pending list", admin=True)
+        assert "当前没有待决预留。" in empty
+        assert module._PENDING_NO_JOB_HINT not in empty
+        rid = await _seed(
+            store,
+            estimate=5,
+            kind="scrape",
+            fingerprint=FP1,
+            key_ref=ref_of(K1),
+            job_id="job-abcdef123456789",
+            accept=True,
+        )
+        output = await _run(plugin, "fc pending list", admin=True)
+        assert module._PENDING_NO_JOB_HINT not in output
+        assert rid in output
+        assert "accepted" in output
+        assert "job-abcd…" in output
+        assert "job-abcdef123456789" not in output
+        assert f"sha256:{ref_of(K1)[:8]}" in output
+        assert ref_of(K1) not in output
+        assert FP1 not in output
+        assert K1 not in output
+        pending = await store.list_pending()
+        assert [record.reservation_id for record in pending] == [rid]
+        assert pending[0].state.value == "accepted"
+        assert pending[0].job_id == "job-abcdef123456789"
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
 async def test_resolve_positive_settles_actual_credits(main_sdk, tmp_path):
     plugin = await _wired_plugin(main_sdk, tmp_path, keys=(K1,))
     store = plugin.store
@@ -948,6 +1026,7 @@ async def test_watch_check_runs_and_pushes_changed(main_sdk, tmp_path):
                 "creditsUsed": 21,
                 "data": {
                     "markdown": "body",
+                    "summary": "集成链路页面摘要",
                     "changeTracking": {
                         "previousScrapeAt": "2026-05-01T00:00:00+00:00",
                         "changeStatus": "changed",
@@ -966,9 +1045,11 @@ async def test_watch_check_runs_and_pushes_changed(main_sdk, tmp_path):
         sub = (await plugin.watch_store.list_all())[0]
         text = await _run(plugin, f"/fc watch check {sub.id}", umo="u1")
         assert "已推送" in text
+        assert "集成链路页面摘要" in text
         assert plugin.context.sent[0][0] == "u1"
-        assert "- old" in plugin.context.sent[0][1]
-        assert len(calls) == 2
+        sent_text = plugin.context.sent[0][1]
+        assert "- old" in sent_text
+        assert sent_text.index("集成链路页面摘要") < sent_text.index("- old")
         payload = json.loads(calls[0].content)
         assert payload["formats"][-1]["type"] == "changeTracking"
         saved = await plugin.watch_store.get(sub.id)
@@ -976,6 +1057,7 @@ async def test_watch_check_runs_and_pushes_changed(main_sdk, tmp_path):
         assert saved.last_notification_hash is not None
         again = await _run(plugin, f"/fc watch check {sub.id}", umo="u1")
         assert "已跳过" in again
+        assert "集成链路页面摘要" in again
         assert len(plugin.context.sent) == 1
     finally:
         await plugin.terminate()

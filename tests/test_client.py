@@ -862,3 +862,124 @@ async def test_single_attempt_failures_call_before_send_once(failure):
     assert calls == [(key_reference(K1), False)]
     assert len(requests) == 1
     await client.aclose()
+
+
+def multipart_fields(request: httpx.Request) -> list[tuple[dict[str, str], bytes]]:
+    """按请求头 boundary 解析 multipart 请求体为 (字段头, 字段数据) 列表。"""
+    content_type = request.headers["content-type"]
+    assert content_type.startswith("multipart/form-data; boundary=")
+    boundary = b"--" + content_type.split("boundary=", 1)[1].encode()
+    fields: list[tuple[dict[str, str], bytes]] = []
+    for segment in request.content.split(boundary)[1:]:
+        if segment.startswith(b"--"):
+            continue
+        header_block, _, data = segment.lstrip(b"\r\n").partition(b"\r\n\r\n")
+        assert data.endswith(b"\r\n")
+        headers = {}
+        for line in header_block.split(b"\r\n"):
+            name, _, value = line.partition(b":")
+            headers[name.decode().strip().lower()] = value.decode().strip()
+        fields.append((headers, data[:-2]))
+    return fields
+
+
+@pytest.mark.asyncio
+async def test_multipart_request_sends_options_json_and_file_bytes():
+    options = json.dumps(
+        {"formats": ["markdown"], "parsers": [{"type": "pdf", "maxPages": 20}]},
+        sort_keys=True,
+    )
+    payload = b"%PDF-1.4\n" + bytes(range(256))
+    client, _, requests = make_client([K1], [ok()])
+    response = await client.request(
+        "POST",
+        "/parse",
+        data={"options": options},
+        files=[("file", ("doc.pdf", payload, "application/pdf"))],
+        headers={"Authorization": "Bearer stale"},
+    )
+    assert response.status_code == 200
+    request = requests[0]
+    assert str(request.url) == "https://api.firecrawl.dev/v2/parse"
+    assert request.headers["authorization"] == f"Bearer {K1}"
+    assert request.extensions["timeout"] == httpx.Timeout(60.0).as_dict()
+    fields = multipart_fields(request)
+    assert fields[0][0] == {"content-disposition": 'form-data; name="options"'}
+    assert fields[0][1] == options.encode("utf-8")
+    assert fields[1][0] == {
+        "content-disposition": 'form-data; name="file"; filename="doc.pdf"',
+        "content-type": "application/pdf",
+    }
+    assert fields[1][1] == payload
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_multipart_file_without_type_defaults_to_octet_stream():
+    client, _, requests = make_client([K1], [ok()])
+    await client.request(
+        "POST",
+        "/parse",
+        data={"options": "{}"},
+        files=[("file", ("blob.zzz", b"raw-bytes"))],
+    )
+    fields = multipart_fields(requests[0])
+    assert fields[1][0]["content-type"] == "application/octet-stream"
+    assert fields[1][1] == b"raw-bytes"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_multipart_rebuilds_identical_body_across_key_rotation():
+    options = '{"formats":["markdown"]}'
+    payload = b"\x00\x01\x02 binary file body kept across attempts"
+    client, _, requests = make_client([K1, K2], [unauthorized(), ok()])
+    response = await client.request(
+        "POST",
+        "/parse",
+        data={"options": options},
+        files=[("file", ("doc.pdf", payload, "application/pdf"))],
+    )
+    assert response.status_code == 200
+    assert len(requests) == 2
+    assert [r.headers["authorization"] for r in requests] == [
+        f"Bearer {K1}",
+        f"Bearer {K2}",
+    ]
+    for request in requests:
+        fields = multipart_fields(request)
+        assert fields[0][1] == options.encode("utf-8")
+        assert fields[1][1] == payload
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_multipart_redirect_not_followed():
+    client, _, requests = make_client(
+        [K1],
+        [httpx.Response(301, headers={"Location": "https://evil.example/v2/parse"})],
+    )
+    with pytest.raises(FirecrawlError) as exc_info:
+        await client.request(
+            "POST",
+            "/parse",
+            data={"options": "{}"},
+            files=[("file", ("doc.pdf", b"%PDF-payload", "application/pdf"))],
+        )
+    error = exc_info.value
+    assert error.category is ErrorCategory.USAGE
+    assert error.status == 301
+    assert error.rotate_key is False
+    assert len(requests) == 1
+    assert "%PDF-payload" not in str(error)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_json_request_unchanged_with_multipart_defaults():
+    client, _, requests = make_client([K1], [ok()])
+    await client.request("POST", "/scrape", json={"url": "https://example.com"})
+    request = requests[0]
+    assert request.headers["content-type"] == "application/json"
+    assert json.loads(request.content) == {"url": "https://example.com"}
+    await client.aclose()

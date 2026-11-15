@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -71,6 +73,9 @@ EXTRA_CALLS = {
     "question": {"format": "question", "question": QUESTION},
     "json": {"format": "json", "json_prompt": PROMPT, "json_schema": SCHEMA},
 }
+IMAGE_URL = "https://img.example/shot.png"
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"png-data"
+DELIVERY_HINT = "页面抓取已完成并结算，未自动重试；重新调用会再次产生费用。"
 
 
 def scrape_ok(data, credits_used=2.5):
@@ -105,6 +110,26 @@ class FailingExecutor:
 
     async def execute_sync(self, kind, payload, *, estimate):
         raise self.error
+        raise self.error
+
+
+class FakeEvent:
+    """记录 send 调用与发送时文件存在性的会话事件替身。"""
+
+    def __init__(self) -> None:
+        self.chains = []
+        self.existed_at_send = []
+
+    async def send(self, chain) -> None:
+        self.existed_at_send.append([Path(p).exists() for p in chain.image_paths])
+        self.chains.append(chain)
+
+
+class FailingEvent:
+    """send 固定抛错的会话事件替身。"""
+
+    async def send(self, chain) -> None:
+        raise RuntimeError("send failed with SECRET-MARKER")
 
 
 class FakePlugin:
@@ -372,3 +397,353 @@ async def test_cancelled_error_propagates(firecrawl_scrape_tool):
     tool = firecrawl_scrape_tool(plugin=plugin)
     with pytest.raises(asyncio.CancelledError):
         await tool.call(None, url=URL)
+
+
+def image_transport(handler) -> httpx.MockTransport:
+    return httpx.MockTransport(handler)
+
+
+@pytest.mark.asyncio
+async def test_screenshot_round_trip_downloads_sends_and_cleans(
+    firecrawl_scrape_tool, tmp_path
+):
+    seen_downloads = []
+
+    def download_handler(request: httpx.Request) -> httpx.Response:
+        seen_downloads.append(request)
+        return httpx.Response(
+            200, headers={"content-type": "image/png"}, content=PNG_BYTES
+        )
+
+    plugin = await make_plugin(
+        tmp_path, [scrape_ok({"screenshot": IMAGE_URL})], config=CONFIG
+    )
+    event = FakeEvent()
+    tool = firecrawl_scrape_tool(
+        plugin=plugin,
+        data_dir=tmp_path,
+        download_transport=image_transport(download_handler),
+    )
+    out = await tool.call(
+        SimpleNamespace(context=SimpleNamespace(event=event)),
+        url=URL,
+        format="screenshot",
+    )
+    await plugin.client.aclose()
+    payload = json.loads(out)
+    assert payload["ok"] is True
+    assert payload["data"] == {
+        "title": "t",
+        "url": METADATA["sourceURL"],
+        "warning": "w",
+        "sent_to_user": True,
+    }
+    assert json.loads(plugin.seen[0].content)["formats"] == ["screenshot"]
+    assert len(plugin.seen) == 1
+    assert "authorization" not in seen_downloads[0].headers
+    assert event.existed_at_send == [[True]]
+    sent_path = Path(event.chains[0].image_paths[0])
+    assert sent_path.suffix == ".png"
+    assert not sent_path.exists()
+    assert list((tmp_path / "screenshots").iterdir()) == []
+    assert plugin.scope.entered == 1
+    await assert_usage(plugin, 2.5, 0.0)
+    assert await plugin.store.list_pending() == []
+
+
+@pytest.mark.asyncio
+async def test_screenshot_without_event_no_network_or_reservation(
+    firecrawl_scrape_tool, tmp_path
+):
+    plugin = await make_plugin(tmp_path, [], config=CONFIG)
+    tool = firecrawl_scrape_tool(plugin=plugin, data_dir=tmp_path)
+    out = await tool.call(None, url=URL, format="screenshot")
+    await plugin.client.aclose()
+    payload = json.loads(out)
+    assert payload["ok"] is False
+    assert payload["category"] == "usage"
+    assert plugin.seen == []
+    assert plugin.scope.entered == 0
+    await assert_usage(plugin, 0.0, 0.0)
+    assert await plugin.store.list_pending() == []
+
+
+@pytest.mark.asyncio
+async def test_screenshot_download_failure_keeps_settled_without_pending(
+    firecrawl_scrape_tool, tmp_path
+):
+    def download_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers={"content-type": "text/html"}, content=b"<html>no</html>"
+        )
+
+    plugin = await make_plugin(
+        tmp_path, [scrape_ok({"screenshot": IMAGE_URL})], config=CONFIG
+    )
+    tool = firecrawl_scrape_tool(
+        plugin=plugin,
+        data_dir=tmp_path,
+        download_transport=image_transport(download_handler),
+    )
+    out = await tool.call(
+        SimpleNamespace(context=SimpleNamespace(event=FakeEvent())),
+        url=URL,
+        format="screenshot",
+    )
+    await plugin.client.aclose()
+    payload = json.loads(out)
+    assert payload["ok"] is False
+    assert payload["category"] == "server"
+    assert payload["hint"] == DELIVERY_HINT
+    assert IMAGE_URL not in out
+    assert len(plugin.seen) == 1
+    assert list((tmp_path / "screenshots").iterdir()) == []
+    await assert_usage(plugin, 2.5, 0.0)
+    assert await plugin.store.list_pending() == []
+
+
+@pytest.mark.asyncio
+async def test_screenshot_send_failure_keeps_settled_without_pending(
+    firecrawl_scrape_tool, tmp_path
+):
+    def download_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers={"content-type": "image/png"}, content=PNG_BYTES
+        )
+
+    plugin = await make_plugin(
+        tmp_path, [scrape_ok({"screenshot": IMAGE_URL})], config=CONFIG
+    )
+    tool = firecrawl_scrape_tool(
+        plugin=plugin,
+        data_dir=tmp_path,
+        download_transport=image_transport(download_handler),
+    )
+    out = await tool.call(
+        SimpleNamespace(context=SimpleNamespace(event=FailingEvent())),
+        url=URL,
+        format="screenshot",
+    )
+    await plugin.client.aclose()
+    payload = json.loads(out)
+    assert payload["ok"] is False
+    assert payload["category"] == "server"
+    assert payload["hint"] == DELIVERY_HINT
+    assert IMAGE_URL not in out
+    assert "SECRET-MARKER" not in out
+    assert len(plugin.seen) == 1
+    assert list((tmp_path / "screenshots").iterdir()) == []
+    await assert_usage(plugin, 2.5, 0.0)
+    assert await plugin.store.list_pending() == []
+
+
+def failing_unlink(self, missing_ok=False):
+    raise OSError("boom-unlink")
+
+
+@pytest.mark.asyncio
+async def test_screenshot_send_success_cleanup_failure_still_ok(
+    firecrawl_scrape_tool, tmp_path, monkeypatch, caplog
+):
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+
+    def download_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers={"content-type": "image/png"}, content=PNG_BYTES
+        )
+
+    plugin = await make_plugin(
+        tmp_path, [scrape_ok({"screenshot": IMAGE_URL})], config=CONFIG
+    )
+    event = FakeEvent()
+    tool = firecrawl_scrape_tool(
+        plugin=plugin,
+        data_dir=tmp_path,
+        download_transport=image_transport(download_handler),
+    )
+    with caplog.at_level("WARNING", logger="astrbot.stub"):
+        out = await tool.call(
+            SimpleNamespace(context=SimpleNamespace(event=event)),
+            url=URL,
+            format="screenshot",
+        )
+    await plugin.client.aclose()
+    payload = json.loads(out)
+    assert payload["ok"] is True
+    assert payload["data"]["sent_to_user"] is True
+    assert any("OSError" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_screenshot_send_failure_cleanup_failure_keeps_delivery_error(
+    firecrawl_scrape_tool, tmp_path, monkeypatch, caplog
+):
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+
+    def download_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers={"content-type": "image/png"}, content=PNG_BYTES
+        )
+
+    plugin = await make_plugin(
+        tmp_path, [scrape_ok({"screenshot": IMAGE_URL})], config=CONFIG
+    )
+    tool = firecrawl_scrape_tool(
+        plugin=plugin,
+        data_dir=tmp_path,
+        download_transport=image_transport(download_handler),
+    )
+    with caplog.at_level("WARNING", logger="astrbot.stub"):
+        out = await tool.call(
+            SimpleNamespace(context=SimpleNamespace(event=FailingEvent())),
+            url=URL,
+            format="screenshot",
+        )
+    await plugin.client.aclose()
+    payload = json.loads(out)
+    assert payload["ok"] is False
+    assert payload["category"] == "server"
+    assert payload["hint"] == DELIVERY_HINT
+    assert "boom-unlink" not in out
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "RuntimeError" in messages
+    assert "OSError" in messages
+
+
+@pytest.mark.asyncio
+async def test_screenshot_cancellation_not_replaced_by_cleanup_error(
+    firecrawl_scrape_tool, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+
+    class SlowEvent:
+        async def send(self, chain) -> None:
+            await asyncio.sleep(5)
+
+    def download_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers={"content-type": "image/png"}, content=PNG_BYTES
+        )
+
+    plugin = await make_plugin(
+        tmp_path, [scrape_ok({"screenshot": IMAGE_URL})], config=CONFIG
+    )
+    tool = firecrawl_scrape_tool(
+        plugin=plugin,
+        data_dir=tmp_path,
+        download_transport=image_transport(download_handler),
+    )
+    task = asyncio.create_task(
+        tool.call(
+            SimpleNamespace(context=SimpleNamespace(event=SlowEvent())),
+            url=URL,
+            format="screenshot",
+        )
+    )
+    await asyncio.sleep(0.2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await plugin.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_screenshot_network_error_keeps_settled_without_pending(
+    firecrawl_scrape_tool, tmp_path
+):
+    def download_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom-net")
+
+    plugin = await make_plugin(
+        tmp_path, [scrape_ok({"screenshot": IMAGE_URL})], config=CONFIG
+    )
+    tool = firecrawl_scrape_tool(
+        plugin=plugin,
+        data_dir=tmp_path,
+        download_transport=image_transport(download_handler),
+    )
+    out = await tool.call(
+        SimpleNamespace(context=SimpleNamespace(event=FakeEvent())),
+        url=URL,
+        format="screenshot",
+    )
+    await plugin.client.aclose()
+    payload = json.loads(out)
+    assert payload["ok"] is False
+    assert payload["category"] == "server"
+    assert payload["hint"] == DELIVERY_HINT
+    assert "boom-net" not in out
+    assert len(plugin.seen) == 1
+    assert list((tmp_path / "screenshots").iterdir()) == []
+    await assert_usage(plugin, 2.5, 0.0)
+    assert await plugin.store.list_pending() == []
+
+
+@pytest.mark.asyncio
+async def test_screenshot_write_oserror_keeps_settled_without_pending(
+    firecrawl_scrape_tool, tmp_path, monkeypatch
+):
+    def broken_write(path, chunks):
+        raise OSError("boom-write")
+
+    monkeypatch.setattr(
+        "astrbot_plugin_firecrawl.tools.screenshot._write_chunks", broken_write
+    )
+
+    def download_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers={"content-type": "image/png"}, content=PNG_BYTES
+        )
+
+    plugin = await make_plugin(
+        tmp_path, [scrape_ok({"screenshot": IMAGE_URL})], config=CONFIG
+    )
+    tool = firecrawl_scrape_tool(
+        plugin=plugin,
+        data_dir=tmp_path,
+        download_transport=image_transport(download_handler),
+    )
+    out = await tool.call(
+        SimpleNamespace(context=SimpleNamespace(event=FakeEvent())),
+        url=URL,
+        format="screenshot",
+    )
+    await plugin.client.aclose()
+    payload = json.loads(out)
+    assert payload["ok"] is False
+    assert payload["category"] == "server"
+    assert payload["hint"] == DELIVERY_HINT
+    assert "boom-write" not in out
+    assert len(plugin.seen) == 1
+    assert list((tmp_path / "screenshots").iterdir()) == []
+    await assert_usage(plugin, 2.5, 0.0)
+    assert await plugin.store.list_pending() == []
+
+
+@pytest.mark.asyncio
+async def test_screenshot_accepts_numeric_string_timeout(
+    firecrawl_scrape_tool, tmp_path
+):
+    def download_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers={"content-type": "image/png"}, content=PNG_BYTES
+        )
+
+    config = {"timeout_seconds": "30", "max_content_chars": 3}
+    plugin = await make_plugin(
+        tmp_path, [scrape_ok({"screenshot": IMAGE_URL})], config=config
+    )
+    tool = firecrawl_scrape_tool(
+        plugin=plugin,
+        data_dir=tmp_path,
+        download_transport=image_transport(download_handler),
+    )
+    out = await tool.call(
+        SimpleNamespace(context=SimpleNamespace(event=FakeEvent())),
+        url=URL,
+        format="screenshot",
+    )
+    await plugin.client.aclose()
+    payload = json.loads(out)
+    assert payload["ok"] is True
+    assert payload["data"]["sent_to_user"] is True

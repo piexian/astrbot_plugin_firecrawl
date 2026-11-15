@@ -7,7 +7,7 @@ import logging
 import sys
 import types
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -42,16 +42,50 @@ class _StubFunctionTool:
         )
 
 
+def _stub_message(self, text):
+    """记录文本并返回自身，模拟 MessageChain.message 链式调用。"""
+    self.text = text
+    return self
+
+
+def _stub_file_image(self, path):
+    """记录图片路径并返回自身，模拟 MessageChain.file_image。"""
+    self.image_paths = [*getattr(self, "image_paths", []), path]
+    return self
+
+
+@dataclass
+class _StubFile:
+    """与 AstrBot File 组件同形的最小替身：name、path 与异步 get_file。"""
+
+    name: str = ""
+    path: str = ""
+
+    async def get_file(self) -> str:
+        return self.path
+
+
+@dataclass
+class _StubReply:
+    """与 AstrBot Reply 组件同形的最小替身：仅 chain。"""
+
+    chain: list = field(default_factory=list)
+
+
 def _install_sdk_stub() -> None:
-    """安装 pytest 专用 AstrBot API stub，提供 FunctionTool、MessageChain 与 logger。"""
+    """安装 pytest 专用 AstrBot API stub，提供 FunctionTool、MessageChain、File/Reply 组件与 logger。"""
     api_module = types.ModuleType("astrbot.api")
     api_module.FunctionTool = _StubFunctionTool
     api_module.logger = logging.getLogger("astrbot.stub")
+    components_module = types.ModuleType("astrbot.api.message_components")
+    components_module.File = _StubFile
+    components_module.Reply = _StubReply
+    api_module.message_components = components_module
     event_module = types.ModuleType("astrbot.api.event")
     event_module.MessageChain = type(
         "MessageChain",
         (),
-        {"message": lambda self, text: setattr(self, "text", text) or self},
+        {"message": _stub_message, "file_image": _stub_file_image},
     )
     root_module = types.ModuleType("astrbot")
     root_module.api = api_module
@@ -59,9 +93,15 @@ def _install_sdk_stub() -> None:
     sys.modules["astrbot"] = root_module
     sys.modules["astrbot.api"] = api_module
     sys.modules["astrbot.api.event"] = event_module
+    sys.modules["astrbot.api.message_components"] = components_module
 
 
-_SDK_MODULE_NAMES = ("astrbot", "astrbot.api", "astrbot.api.event")
+_SDK_MODULE_NAMES = (
+    "astrbot",
+    "astrbot.api",
+    "astrbot.api.event",
+    "astrbot.api.message_components",
+)
 _MISSING = object()
 
 

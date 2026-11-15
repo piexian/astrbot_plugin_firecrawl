@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
+import httpx
 from astrbot.api import FunctionTool, logger
+from astrbot.api.event import MessageChain
 
 from ..firecrawl_api.errors import ErrorCategory, FirecrawlError
 from ..firecrawl_api.scrape import (
@@ -17,15 +20,18 @@ from ..firecrawl_api.scrape import (
 from .execution import PendingRequestError
 from .result import fail, ok
 from .schema import object_schema
+from .screenshot import ScreenshotDeliveryError, cleanup_screenshot, download_screenshot
 
 _PLUGIN_UNAVAILABLE = FirecrawlError(
     ErrorCategory.CONFIG, "插件未初始化，无法调用 firecrawl_scrape。"
 )
 
 _SCRAPE_EXAMPLE = {"url": "https://example.com"}
+_SCREENSHOT_DELIVERY_HINT = "页面抓取已完成并结算，未自动重试；重新调用会再次产生费用。"
 
 _TOOL_DESCRIPTION = (
     "用 Firecrawl 抓取单个网页，返回 markdown 正文、链接或问答等内容；"
+    "screenshot 格式会把页面截图发送到当前会话；"
     "question、json 格式与提示注入检测每页各加 4 credits，PDF 页数、黑名单域名与"
     "正文长度上限由插件配置控制。"
 )
@@ -41,9 +47,18 @@ def _scrape_parameters() -> dict:
             },
             "format": {
                 "type": "string",
-                "enum": ["markdown", "summary", "links", "html", "question", "json"],
+                "enum": [
+                    "markdown",
+                    "summary",
+                    "links",
+                    "html",
+                    "question",
+                    "json",
+                    "screenshot",
+                ],
                 "description": (
-                    "可选。返回内容格式，默认 markdown；question、json 每页额外计费。"
+                    "可选。返回内容格式，默认 markdown；screenshot 会把页面截图"
+                    "发送到当前会话；question、json 每页额外计费。"
                 ),
             },
             "question": {
@@ -99,6 +114,8 @@ class FirecrawlScrapeTool(FunctionTool):
     """firecrawl_scrape 工具：未注入 plugin 时零 I/O 返回 config 错误。"""
 
     plugin: Any = None
+    data_dir: Path | None = None
+    download_transport: httpx.AsyncBaseTransport | None = None
     name: str = "firecrawl_scrape"
     description: str = _TOOL_DESCRIPTION
     parameters: dict = field(default_factory=_scrape_parameters)
@@ -132,6 +149,7 @@ class FirecrawlScrapeTool(FunctionTool):
             if unexpected:
                 raise ValueError("不支持的抓取参数。")
             return await self._run(
+                context,
                 url=url,
                 format=format,
                 question=question,
@@ -143,13 +161,51 @@ class FirecrawlScrapeTool(FunctionTool):
                 proxy=proxy,
                 check_prompt_injection=check_prompt_injection,
             )
+        except ScreenshotDeliveryError as error:
+            cause = error.__cause__
+            cause_type = (
+                type(cause).__name__ if cause is not None else type(error).__name__
+            )
+            logger.warning(f"firecrawl_scrape 截图投递失败：{cause_type}")
+            return fail(error, hint=_SCREENSHOT_DELIVERY_HINT)
         except Exception as error:
             if not isinstance(error, (FirecrawlError, ValueError, PendingRequestError)):
                 logger.warning(f"firecrawl_scrape 未知异常：{type(error).__name__}")
             return fail(error, example=_SCRAPE_EXAMPLE)
 
-    async def _run(self, **kwargs: Any) -> str:
+    def _require_delivery_context(self, context: Any) -> Any:
+        """screenshot 必须先确认会话事件与数据目录，再做任何付费请求。"""
+        wrapper = getattr(context, "context", None)
+        event = getattr(wrapper, "event", None)
+        if event is None:
+            raise ValueError("screenshot 格式必须在当前会话事件中调用，无法发送截图。")
+        if self.data_dir is None:
+            raise ValueError("插件数据目录未注入，无法保存截图。")
+        return event
+
+    async def _deliver_screenshot(self, trimmed: dict, event: Any) -> None:
+        """在同一 request_scope 内下载截图、发送到当前会话并清理临时文件。"""
+        screenshot_url = trimmed.pop("screenshot")
+        path = await download_screenshot(
+            screenshot_url,
+            data_dir=self.data_dir,
+            timeout_seconds=float(self.plugin.config.get("timeout_seconds", 60)),
+            transport=self.download_transport,
+        )
+        try:
+            await event.send(MessageChain().file_image(str(path)))
+        except Exception as error:
+            raise ScreenshotDeliveryError(
+                "页面截图已抓取并结算，但图片发送失败。"
+            ) from error
+        finally:
+            await cleanup_screenshot(path)
+        trimmed["sent_to_user"] = True
+
+    async def _run(self, context: Any, **kwargs: Any) -> str:
         plugin = self.plugin
+        is_screenshot = kwargs["format"] == "screenshot"
+        event = self._require_delivery_context(context) if is_screenshot else None
         pdf_max_pages = plugin.config.get("pdf_max_pages", 20)
         max_content_chars = plugin.config.get("max_content_chars", 8000)
         config_injection = plugin.config.get("check_prompt_injection", False)
@@ -181,10 +237,12 @@ class FirecrawlScrapeTool(FunctionTool):
             response = await plugin.executor.execute_sync(
                 "scrape", payload, estimate=estimate
             )
+            trimmed = trim_scrape_response(
+                response.json(),
+                kwargs["format"],
+                max_content_chars=max_content_chars,
+            )
+            if is_screenshot:
+                await self._deliver_screenshot(trimmed, event)
 
-        trimmed = trim_scrape_response(
-            response.json(),
-            kwargs["format"],
-            max_content_chars=max_content_chars,
-        )
         return ok(trimmed)

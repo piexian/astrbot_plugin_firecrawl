@@ -15,6 +15,7 @@ from firecrawl_api.budget import (
     Reservation,
     ReservationState,
     estimate_page,
+    estimate_parse,
     estimate_search,
     estimate_site,
     utc_day,
@@ -238,3 +239,34 @@ def test_utc_day_handles_timezone_boundaries():
 def test_utc_day_rejects_naive_datetime():
     with pytest.raises(ValueError):
         utc_day(datetime(2026, 1, 1, 12, 0))
+
+
+def test_estimate_parse_pdf_bills_base_pages_and_injection():
+    assert estimate_parse(is_pdf=True) == 21
+    assert estimate_parse(is_pdf=True, pdf_max_pages=1) == 2
+    assert estimate_parse(is_pdf=True, pdf_max_pages=10000) == 10001
+    assert (
+        estimate_parse(is_pdf=True, pdf_max_pages=10000, check_prompt_injection=True)
+        == 10005
+    )
+
+
+def test_estimate_parse_non_pdf_ignores_page_cap():
+    assert estimate_parse(is_pdf=False) == 1
+    assert estimate_parse(is_pdf=False, pdf_max_pages=10000) == 1
+    assert estimate_parse(is_pdf=False, check_prompt_injection=True) == 5
+
+
+def test_estimate_parse_rejects_invalid_args():
+    with pytest.raises(ValueError):
+        estimate_parse(is_pdf=1)
+    with pytest.raises(ValueError):
+        estimate_parse(is_pdf=True, pdf_max_pages=0)
+    with pytest.raises(ValueError):
+        estimate_parse(is_pdf=True, pdf_max_pages=10001)
+    with pytest.raises(ValueError):
+        estimate_parse(is_pdf=True, pdf_max_pages=True)
+    with pytest.raises(ValueError):
+        estimate_parse(is_pdf=True, pdf_max_pages=1.5)
+    with pytest.raises(ValueError):
+        estimate_parse(is_pdf=True, check_prompt_injection="yes")

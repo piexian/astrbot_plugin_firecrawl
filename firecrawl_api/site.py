@@ -2,21 +2,14 @@
 
 from __future__ import annotations
 
-import re
-
-from . import budget
+from . import budget, tasks
 from .domains import assert_url_allowed, normalize_url
 from .scrape import build_scrape_options
+from .tasks import validate_task_id
 
 _ACTIONS = ("map", "crawl", "batch", "status", "cancel")
 _TASK_KINDS = ("crawl", "batch")
 _TRIM_ACTIONS = ("map", "crawl", "batch", "status", "cancel")
-_KEY_REF_RE = re.compile(r"[0-9a-f]{64}")
-_TASK_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
-_HANDLE_RE = re.compile(
-    rf"(crawl|batch):({_TASK_ID_RE.pattern})@({_KEY_REF_RE.pattern})"
-)
-_HANDLE_FORMAT = "任务句柄格式必须为 <kind>:<firecrawl_id>@<64位小写sha256 key_ref>"
 
 
 def _require_bool(value: object, name: str) -> bool:
@@ -40,13 +33,6 @@ def _require_str(value: object, name: str) -> str:
     if not cleaned:
         raise ValueError(f"{name} 不能为空")
     return cleaned
-
-
-def _validate_task_id(value: object, name: str) -> str:
-    """校验任务ID为 [A-Za-z0-9_-]+，失败固定报错不回显输入。"""
-    if not isinstance(value, str) or _TASK_ID_RE.fullmatch(value) is None:
-        raise ValueError(f"{name} 只允许 ASCII 字母、数字、下划线、连字符")
-    return value
 
 
 def _require_path_list(value: object, name: str) -> list[str]:
@@ -123,7 +109,7 @@ def normalize_site_args(
         if exclude_paths is not None
         else None
     )
-    cleaned_job_id = _validate_task_id(job_id, "job_id") if job_id is not None else None
+    cleaned_job_id = validate_task_id(job_id, "job_id") if job_id is not None else None
     if kind is not None and kind not in _TASK_KINDS:
         raise ValueError(f"kind 只允许 {'、'.join(_TASK_KINDS)}")
 
@@ -294,27 +280,18 @@ def estimate_site_credits(
 
 
 def make_task_handle(kind: str, firecrawl_id: str, key_ref: str) -> str:
-    """编码 crawl/batch 任务句柄 <kind>:<firecrawl_id>@<完整64位小写key_ref>。"""
+    """编码 crawl/batch 任务句柄，委托共享实现并拒绝 site 不支持的 kind。"""
     if kind not in _TASK_KINDS:
         raise ValueError(f"kind 只允许 {'、'.join(_TASK_KINDS)}")
-    _validate_task_id(firecrawl_id, "firecrawl_id")
-    if not isinstance(key_ref, str) or not _KEY_REF_RE.fullmatch(key_ref):
-        raise ValueError("key_ref 必须是 64 位小写 SHA-256 十六进制摘要")
-    return f"{kind}:{firecrawl_id}@{key_ref}"
+    return tasks.make_task_handle(kind, firecrawl_id, key_ref)
 
 
 def parse_task_handle(handle: str) -> dict:
-    """解码任务句柄；格式非法时抛 ValueError，错误信息不回显句柄内容。"""
-    if not isinstance(handle, str):
-        raise ValueError(_HANDLE_FORMAT)
-    match = _HANDLE_RE.fullmatch(handle)
-    if match is None:
-        raise ValueError(_HANDLE_FORMAT)
-    return {
-        "kind": match.group(1),
-        "firecrawl_id": match.group(2),
-        "key_ref": match.group(3),
-    }
+    """解码 crawl/batch 任务句柄，委托共享实现并拒绝 agent。"""
+    parsed = tasks.parse_task_handle(handle)
+    if parsed["kind"] not in _TASK_KINDS:
+        raise ValueError(tasks.HANDLE_FORMAT)
+    return parsed
 
 
 def _cap_list(items: list, max_items: int | None) -> tuple[list, bool]:
@@ -411,7 +388,7 @@ def trim_site_response(
         firecrawl_id = response.get("id")
         if not isinstance(firecrawl_id, str):
             raise ValueError("crawl/batch 提交响应结构不符合契约：id 必须是字符串")
-        trimmed["id"] = _validate_task_id(firecrawl_id, "id")
+        trimmed["id"] = validate_task_id(firecrawl_id, "id")
         url = response.get("url")
         if url is not None:
             if not isinstance(url, str):

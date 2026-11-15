@@ -279,3 +279,16 @@ def test_pending_logs_direct_remote_cause(caplog):
     assert raw_error in message
     assert "SCRAPE_PROMPT_INJECTION_DETECTED" in message
     assert "request_id='req-injection-1'" in message
+
+
+def test_hint_override_applies_and_defaults_unchanged():
+    """hint 覆盖立即生效且不影响其他字段；省略时保持各类别默认提示。"""
+    delivery_hint = "页面抓取已完成并结算，未自动重试；重新调用会再次产生费用。"
+    server_default = json.loads(fail(RuntimeError("boom")))
+    overridden = json.loads(fail(RuntimeError("boom"), hint=delivery_hint))
+    assert overridden["hint"] == delivery_hint
+    assert overridden["error"] == server_default["error"]
+    assert overridden["category"] == server_default["category"]
+
+    budget_default = json.loads(fail(BudgetExceeded("日预算已用尽")))
+    assert json.loads(fail(BudgetExceeded("日预算已用尽"), hint=None)) == budget_default

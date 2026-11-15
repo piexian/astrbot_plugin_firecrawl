@@ -1,10 +1,11 @@
-"""SQLite 存储：预算账本与 watch 订阅；schema 原子迁移、短事务与 UTC 时间处理。"""
+"""SQLite 存储：预算账本、watch 订阅与 Agent 任务；schema 原子迁移、短事务与 UTC 时间处理。"""
 
 from __future__ import annotations
 
 import asyncio
 import re
 import sqlite3
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -20,7 +21,7 @@ from .firecrawl_api.budget import (
 )
 from .firecrawl_api.domains import normalize_url
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _TERMINAL_STATES = (ReservationState.SETTLED.value, ReservationState.RELEASED.value)
 _FINGERPRINT = re.compile(r"[0-9a-f]{64}")
 
@@ -81,9 +82,27 @@ _DDL_WATCH_SUBSCRIPTIONS = (
     ")"
 )
 
+_DDL_AGENT_TASKS = (
+    "CREATE TABLE IF NOT EXISTS agent_tasks ("
+    " reservation_id TEXT PRIMARY KEY,"
+    " umo TEXT NOT NULL,"
+    " prompt TEXT NOT NULL,"
+    " status TEXT NOT NULL CHECK (status IN ("
+    " 'submitting','processing','completed','failed','cancelled')),"
+    " task_handle TEXT UNIQUE,"
+    " result_json TEXT,"
+    " credits_used REAL CHECK (credits_used IS NULL OR credits_used >= 0),"
+    " error TEXT,"
+    " notified_at TEXT,"
+    " created_at TEXT NOT NULL,"
+    " updated_at TEXT NOT NULL"
+    ")"
+)
+
 _MIGRATIONS = {
     1: (_DDL_DAILY_USAGE, _DDL_RESERVATIONS, _DDL_PENDING_INDEX),
     2: (_DDL_WATCH_SUBSCRIPTIONS,),
+    3: (_DDL_AGENT_TASKS,),
 }
 _INSERT_RESERVATION = (
     f"INSERT INTO reservations ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -297,6 +316,18 @@ def _utc_stamp(now: datetime) -> str:
     return now.astimezone(timezone.utc).isoformat()
 
 
+def _enable_wal(conn: sqlite3.Connection) -> None:
+    """提交后切换 WAL；并发初始化造成短暂锁定时在 5 秒内有界重试。"""
+    for attempt in range(100):
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            if "database is locked" not in str(exc) or attempt == 99:
+                raise
+            time.sleep(0.05)
+
+
 def _migrate_sync(db_path: Path) -> None:
     """按 user_version 逐步迁移到最新 schema，重复执行幂等，更高版本拒绝。"""
     conn = sqlite3.connect(db_path, isolation_level=None)
@@ -313,7 +344,7 @@ def _migrate_sync(db_path: Path) -> None:
                     conn.execute(ddl)
             conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         conn.commit()
-        conn.execute("PRAGMA journal_mode=WAL")
+        _enable_wal(conn)
     except BaseException:
         conn.rollback()
         raise
@@ -386,7 +417,7 @@ class SQLiteStore:
         self._clock = clock
 
     async def initialize(self) -> None:
-        """按 user_version 逐步迁移 schema（当前 v2），幂等，更高版本拒绝。"""
+        """按 user_version 逐步迁移 schema（当前 v3），幂等，更高版本拒绝。"""
         await asyncio.to_thread(_migrate_sync, self._db_path)
 
     async def reserve(
@@ -716,7 +747,7 @@ class WatchStore:
         self._clock = clock
 
     async def initialize(self) -> None:
-        """按 user_version 逐步迁移 schema（当前 v2），幂等，更高版本拒绝。"""
+        """按 user_version 逐步迁移 schema（当前 v3），幂等，更高版本拒绝。"""
         await asyncio.to_thread(_migrate_sync, self._db_path)
 
     async def create(

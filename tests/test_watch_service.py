@@ -93,16 +93,19 @@ def tracking_response(**overrides):
     return {"success": True, "data": data}
 
 
-def changed_response():
-    """构造 changed 响应。"""
-    return tracking_response(
-        changeTracking={
+def changed_response(summary=None):
+    """构造 changed 响应，可选携带 data.summary。"""
+    overrides = {
+        "changeTracking": {
             "previousScrapeAt": "2026-05-01T00:00:00+00:00",
             "changeStatus": "changed",
             "visibility": "visible",
             "diff": {"text": "- old\n+ new"},
         }
-    )
+    }
+    if summary is not None:
+        overrides["summary"] = summary
+    return tracking_response(**overrides)
 
 
 async def _make(store_path, clock):
@@ -170,10 +173,11 @@ async def test_check_now_bypasses_due_and_pushes_changed(tmp_path):
 async def test_changed_skips_duplicate_notification_hash(tmp_path):
     clock = _Clock(_T0)
     plugin, store, service, record = await _make(tmp_path / "w.db", clock)
-    plugin.executor.response = changed_response()
+    plugin.executor.response = changed_response(summary="去重链路摘要")
     await service.check_now(record.id)
     text = await service.check_now(record.id)
     assert "已跳过" in text
+    assert "去重链路摘要" in text
     assert len(plugin.sent) == 1
 
 
@@ -352,3 +356,85 @@ async def test_remote_error_reports_fixed_text_and_advances(tmp_path, caplog):
     assert "secret remote detail" in caplog.text
     saved = await store.get(record.id)
     assert saved.next_check_at == "2026-05-01T08:05:00+00:00"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides, marker",
+    [
+        (
+            {"changeTracking": None, "summary": "缺失链路摘要"},
+            "缺少变更跟踪数据",
+        ),
+        (
+            {
+                "changeTracking": {
+                    "previousScrapeAt": None,
+                    "changeStatus": "new",
+                    "visibility": "visible",
+                },
+                "summary": "首次链路摘要",
+            },
+            "首次抓取",
+        ),
+        (
+            {"summary": "无变化链路摘要"},
+            "无变化",
+        ),
+        (
+            {
+                "changeTracking": {
+                    "previousScrapeAt": "2026-05-01T00:00:00+00:00",
+                    "changeStatus": "removed",
+                    "visibility": "hidden",
+                },
+                "summary": "移除链路摘要",
+            },
+            "已移除",
+        ),
+    ],
+)
+async def test_non_changed_check_appends_summary(tmp_path, overrides, marker):
+    clock = _Clock(_T0)
+    plugin, store, service, record = await _make(tmp_path / "w.db", clock)
+    plugin.executor.response = tracking_response(**overrides)
+    text = await service.check_now(record.id)
+    assert marker in text
+    assert text.endswith(overrides["summary"])
+    assert plugin.sent == []
+
+
+@pytest.mark.asyncio
+async def test_check_without_summary_returns_plain_status_text(tmp_path):
+    clock = _Clock(_T0)
+    plugin, store, service, record = await _make(tmp_path / "w.db", clock)
+    plugin.executor.response = tracking_response()
+    text = await service.check_now(record.id)
+    assert text == "检查完成：页面无变化（same）。"
+
+
+@pytest.mark.asyncio
+async def test_changed_check_notifies_summary_before_diff(tmp_path):
+    clock = _Clock(_T0)
+    plugin, store, service, record = await _make(tmp_path / "w.db", clock)
+    plugin.executor.response = changed_response(summary="变更链路摘要")
+    text = await service.check_now(record.id)
+    assert "已推送" in text
+    assert "变更链路摘要" in text
+    notification = plugin.sent[0][1]
+    assert "变更链路摘要" in notification
+    assert notification.index("页面摘要：") < notification.index("- old")
+    saved = await store.get(record.id)
+    assert saved.last_status == "changed"
+
+
+@pytest.mark.asyncio
+async def test_long_summary_truncated_to_total_limit(tmp_path):
+    clock = _Clock(_T0)
+    plugin, store, service, record = await _make(tmp_path / "w.db", clock)
+    plugin.executor.response = tracking_response(summary="摘" * 8000)
+    text = await service.check_now(record.id)
+    assert len(text) <= 6000
+    assert text.startswith("检查完成：页面无变化（same）。")
+    assert text.endswith("[摘要已截断]")
+    assert plugin.sent == []

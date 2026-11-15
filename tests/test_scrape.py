@@ -73,6 +73,47 @@ def test_build_scrape_payload_format_whitelist():
         build_scrape_payload("https://example.com/a", output_format="extract")
 
 
+def test_build_scrape_payload_screenshot_string_array():
+    payload = build_scrape_payload("https://example.com/a", output_format="screenshot")
+    assert payload["formats"] == ["screenshot"]
+    with pytest.raises(ValueError):
+        build_scrape_payload(
+            "https://example.com/a", output_format="screenshot", question="问"
+        )
+
+
+def test_estimate_screenshot_has_no_surcharge():
+    assert estimate_page("screenshot") == estimate_page("markdown")
+    args = normalize_scrape_args("https://example.com/a", output_format="screenshot")
+    assert estimate_scrape_credits(args) == estimate_page("screenshot")
+    assert (
+        estimate_page("screenshot", pdf_max_pages=1, check_prompt_injection=True)
+        == 1 + 4 + 1
+    )
+
+
+def test_trim_scrape_response_screenshot_extracts_url_with_context():
+    response = scrape_response(
+        markdown=None, screenshot="  https://img.example/s.png  "
+    )
+    trimmed = trim_scrape_response(response, "screenshot", max_content_chars=10)
+    assert trimmed == {
+        "title": "Page",
+        "url": "https://example.com/a",
+        "screenshot": "https://img.example/s.png",
+        "warning": "partial render",
+    }
+
+
+def test_trim_scrape_response_screenshot_rejects_bad_structure_without_echo():
+    for bad in (None, 42, "", "   "):
+        with pytest.raises(ValueError) as excinfo:
+            trim_scrape_response(
+                {"data": {"screenshot": bad}}, "screenshot", max_content_chars=10
+            )
+        assert str(excinfo.value) == "data.screenshot 必须是非空字符串 URL"
+
+
 def test_build_scrape_payload_question_requires_question():
     with pytest.raises(ValueError):
         build_scrape_payload("https://example.com/a", output_format="question")

@@ -5,7 +5,15 @@ from __future__ import annotations
 from . import budget
 from .domains import assert_url_allowed
 
-_FORMATS = ("markdown", "summary", "links", "html", "question", "json")
+_FORMATS = (
+    "markdown",
+    "summary",
+    "links",
+    "html",
+    "question",
+    "json",
+    "screenshot",
+)
 _PROXIES = ("auto", "basic", "enhanced")
 _PDF_LIMITS = (1, 10000)
 _PROSE_FIELDS = {"markdown": "content", "html": "content", "summary": "content"}
@@ -125,7 +133,7 @@ def normalize_scrape_args(
 def _assemble_options(args: dict) -> dict:
     """由规范化选项组装每页选项字典；formats/parsers 只在此一处组装。"""
     formats: list = []
-    for name in ("markdown", "summary", "links", "html"):
+    for name in ("markdown", "summary", "links", "html", "screenshot"):
         if args["output_format"] == name:
             formats.append(name)
     if args["output_format"] == "question":
@@ -181,7 +189,7 @@ def trim_scrape_response(
     max_content_chars: int,
     max_list_items: int | None = None,
 ) -> dict:
-    """裁剪 scrape 响应：正文按字符截断，links/json 保持合法结构并按字段级标记。"""
+    """裁剪 scrape 响应：正文按字符截断，links/json 校验结构，screenshot 提取图片 URL。"""
     if output_format not in _FORMATS:
         raise ValueError(f"format 只允许 {'、'.join(_FORMATS)}，收到 {output_format!r}")
     max_chars = _require_positive_int(max_content_chars, "max_content_chars")
@@ -229,6 +237,11 @@ def trim_scrape_response(
         trimmed["answer"] = content
         if truncated:
             trimmed["truncated"] = True
+    elif output_format == "screenshot":
+        screenshot = data.get("screenshot")
+        if not isinstance(screenshot, str) or not screenshot.strip():
+            raise ValueError("data.screenshot 必须是非空字符串 URL")
+        trimmed["screenshot"] = screenshot.strip()
     else:
         extracted = data.get("json")
         if not isinstance(extracted, dict):

@@ -8,6 +8,7 @@ import pytest
 from astrbot_plugin_firecrawl.watch.core import (
     WATCH_MAX_MESSAGE_CHARS,
     WatchCheckResult,
+    append_watch_summary,
     build_watch_notification,
     build_watch_request,
     notification_identity,
@@ -39,6 +40,7 @@ def test_build_watch_request_appends_change_tracking_format():
     assert request.payload["url"] == "https://example.com/a"
     assert request.payload["formats"] == [
         "markdown",
+        "summary",
         {"type": "changeTracking", "modes": ["git-diff"], "tag": "page-a"},
     ]
     assert request.payload["parsers"] == [{"type": "pdf", "maxPages": 20}]
@@ -95,6 +97,7 @@ def test_build_watch_request_blocked_domains_allow_and_reject():
     assert request.payload["url"] == "https://notx.com/post"
     assert request.payload["formats"] == [
         "markdown",
+        "summary",
         {"type": "changeTracking", "modes": ["git-diff"], "tag": "page-a"},
     ]
     assert request.estimate == 21
@@ -104,6 +107,16 @@ def test_build_watch_request_blocked_domains_allow_and_reject():
             tag="t",
             blocked_domains=_BLOCKED,
         )
+
+
+def test_build_watch_request_summary_format_order_and_estimate_unchanged():
+    request = build_watch_request("https://example.com/a", tag="t")
+    assert request.payload["formats"] == [
+        "markdown",
+        "summary",
+        {"type": "changeTracking", "modes": ["git-diff"], "tag": "t"},
+    ]
+    assert request.estimate == 21
 
 
 def test_parse_watch_response_four_statuses():
@@ -214,6 +227,37 @@ def test_parse_watch_response_changed_requires_diff_text():
         )
 
 
+def test_parse_watch_response_summary_passes_through_all_statuses():
+    for status in ("new", "same", "changed", "removed"):
+        tracking = {"changeStatus": status, "visibility": "visible"}
+        if status != "new":
+            tracking["previousScrapeAt"] = _PREVIOUS
+        if status == "changed":
+            tracking["diff"] = {"text": "- old\n+ new"}
+        result = parse_watch_response(
+            tracking_response(changeTracking=tracking, summary="页面摘要")
+        )
+        assert result.status == status
+        assert result.summary == "页面摘要"
+    unavailable = parse_watch_response(
+        tracking_response(changeTracking=None, summary="页面摘要")
+    )
+    assert unavailable.status == "unavailable"
+    assert unavailable.summary == "页面摘要"
+
+
+def test_parse_watch_response_summary_missing_or_null_is_none():
+    assert parse_watch_response(tracking_response()).summary is None
+    assert parse_watch_response(tracking_response(summary=None)).summary is None
+
+
+def test_parse_watch_response_rejects_non_string_summary():
+    with pytest.raises(ValueError, match="summary"):
+        parse_watch_response(tracking_response(summary=123))
+    with pytest.raises(ValueError, match="summary"):
+        parse_watch_response(tracking_response(changeTracking=None, summary=["a"]))
+
+
 def test_notification_identity_is_stable_and_boundary_safe():
     assert notification_identity(_PREVIOUS, "- a") == notification_identity(
         _PREVIOUS, "- a"
@@ -260,6 +304,67 @@ def test_build_watch_notification_truncates_to_limit():
     assert len(message) == WATCH_MAX_MESSAGE_CHARS
     assert f"完整 {len(diff)} 字符" in message
     assert message.count("x") < len(diff)
+
+
+def test_append_watch_summary_preserves_status_and_bounds_text():
+    base = "检查完成：页面无变化（same）。"
+    assert append_watch_summary(base, None) == base
+    assert append_watch_summary(base, "") == base
+    message = append_watch_summary(base, "简短摘要")
+    assert message == f"{base}\n\n页面摘要：\n简短摘要"
+    assert append_watch_summary(base, "简短摘要", max_chars=len(message)) == message
+
+    truncated = append_watch_summary(base, "摘" * 200, max_chars=100)
+    assert len(truncated) == 100
+    assert truncated.startswith(base)
+    assert "摘要已截断" in truncated
+
+
+def test_append_watch_summary_rejects_invalid_or_tiny_limit():
+    for bad in (0, -1, True, "6000", None):
+        with pytest.raises(ValueError, match="max_chars"):
+            append_watch_summary("状态", "摘要", max_chars=bad)
+    with pytest.raises(ValueError, match="容纳不下"):
+        append_watch_summary("状态" * 20, "摘要", max_chars=20)
+
+
+def test_build_watch_notification_places_summary_before_diff():
+    result = WatchCheckResult(
+        status="changed",
+        previous_scrape_at=_PREVIOUS,
+        diff_text="- old\n+ new",
+        summary="页面摘要内容",
+    )
+    message = build_watch_notification("https://example.com/a", result)
+    assert "页面摘要：\n页面摘要内容" in message
+    assert message.index("页面摘要内容") < message.index("- old")
+
+
+def test_build_watch_notification_bounds_summary_and_diff():
+    result = WatchCheckResult(
+        status="changed",
+        previous_scrape_at=_PREVIOUS,
+        diff_text="d" * 7000,
+        summary="s" * 2500,
+    )
+    message = build_watch_notification("https://example.com/a", result)
+    assert len(message) == WATCH_MAX_MESSAGE_CHARS
+    assert message.count("s") <= 2000
+    assert "摘要已截断" in message
+    assert "diff 已截断：完整 7000 字符" in message
+    assert message.index("摘要已截断") < message.index("diff 已截断")
+
+
+def test_build_watch_notification_empty_summary_keeps_original_format():
+    without_summary = WatchCheckResult(
+        status="changed", previous_scrape_at=_PREVIOUS, diff_text="diff"
+    )
+    empty_summary = WatchCheckResult(
+        status="changed", previous_scrape_at=_PREVIOUS, diff_text="diff", summary=""
+    )
+    assert build_watch_notification(
+        "https://example.com/a", empty_summary
+    ) == build_watch_notification("https://example.com/a", without_summary)
 
 
 def test_build_watch_notification_rejects_non_changed():

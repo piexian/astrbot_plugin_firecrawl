@@ -5,10 +5,12 @@
 ## 功能
 
 - 网页搜索：搜索网页、新闻和图片，支持域名筛选，可同时抓取结果正文。
-- 单页抓取：返回 Markdown、摘要、链接、HTML、页面问答或 JSON 抽取结果。
+- 单页抓取：返回 Markdown、摘要、链接、HTML、页面问答或 JSON 抽取结果，也可将页面截图发送到当前会话。
+- 群文件问答：当前或引用消息中的文档由 LLM 工具转换为 Markdown。
 - 站点任务：获取站点链接、爬取站点、批量抓取，并查询或取消异步任务。
+- Agent 后台研究：管理员提交、查询或取消任务，完成后向原会话推送结果。
 - 多 API Key 轮询：鉴权、额度或限流失败的 Key 会暂停使用。
-- 页面变更订阅：按周期检查指定页面，仅在实际变化时向原会话推送 git-diff。
+- 页面变更订阅：按周期检查指定页面，变更通知依次包含页面摘要与 git-diff；手动检查也会返回摘要。
 - 费用控制：支持单次预估上限、UTC 每日额度、并发限制和待决记录管理。
 
 ## 安装
@@ -51,12 +53,14 @@ https://github.com/piexian/astrbot_plugin_firecrawl
 
 ### LLM Tool 自动调用
 
-插件注册了 3 个 LLM Tool，模型会根据对话内容选择调用：
+插件注册了 5 个 LLM Tool，模型会根据对话内容选择调用：
 
 | 工具 | 用途 |
 |------|------|
 | `firecrawl_search` | 搜索网页、新闻或图片，支持域名筛选和结果正文抓取 |
 | `firecrawl_scrape` | 抓取单个网页，支持 Markdown、摘要、链接、HTML、问答和 JSON |
+| `firecrawl_parse` | 解析当前或引用消息中的文档为 Markdown |
+| `firecrawl_agent` | 管理员提交、查询或取消 Agent 后台研究任务 |
 | `firecrawl_site` | 执行 map、crawl、batch，或用任务句柄执行 status、cancel |
 
 例如，可以直接对机器人说：
@@ -64,6 +68,12 @@ https://github.com/piexian/astrbot_plugin_firecrawl
 - “搜索最近的 AstrBot 新闻，返回标题和链接。”
 - “抓取 https://example.com 的正文。”
 - “列出 https://example.com 的页面链接。”
+
+`firecrawl_scrape` 支持 `format=screenshot`：抓取成功后插件会把页面截图作为图片发送到当前会话，模型只收到标题、来源 URL、warning 和发送状态，不包含临时图片地址（该地址 24 小时后失效）。截图不产生额外格式费用，按单页抓取计费，PDF 页数上限与提示注入检测照常影响费用预估。
+
+群文件问答由 `firecrawl_parse` 承担：默认使用云端 Firecrawl Parse，云端不可用时回退本地 MarkItDown；超过 50 MB 的 PDF、DOCX、XLSX/XLS、PPTX、EPUB、CSV、HTML 直接本地解析，不消耗 Firecrawl credits。
+
+`firecrawl_agent` 仅管理员可用。`action` 为 `start`、`status` 或 `cancel`。`start` 必须提供 `prompt` 和 `max_credits`（1–2500），立即返回 `task_handle`；任务在后台执行，完成后向原会话推送结果，插件重启后会恢复未完成和未通知的任务。
 
 ### 管理指令
 

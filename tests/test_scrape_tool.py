@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -72,7 +73,15 @@ def test_tool_metadata_matches_schema(firecrawl_scrape_tool):
         if param.kind is inspect.Parameter.VAR_KEYWORD
     ]
     assert var_keyword == ["unexpected"]
-    formats = ["markdown", "summary", "links", "html", "question", "json"]
+    formats = [
+        "markdown",
+        "summary",
+        "links",
+        "html",
+        "question",
+        "json",
+        "screenshot",
+    ]
     assert props["format"]["enum"] == formats
     assert props["proxy"]["enum"] == ["auto", "basic", "enhanced"]
     injection_description = props["check_prompt_injection"]["description"]
@@ -161,3 +170,32 @@ async def test_unknown_fields_hidden_and_example_valid(firecrawl_scrape_tool):
     example = result["example"]
     assert set(example) == {"url"}
     normalize_scrape_args(**example)
+
+
+@pytest.mark.asyncio
+async def test_screenshot_without_event_rejects_before_io(firecrawl_scrape_tool):
+    """screenshot 在会话事件缺失时零网络零预留收敛为 usage。"""
+    plugin = _FakePlugin({})
+    tool = firecrawl_scrape_tool(plugin=plugin)
+    result = json.loads(
+        await tool.call(None, url="https://example.com", format="screenshot")
+    )
+    assert result["ok"] is False
+    assert result["category"] == "usage"
+    assert plugin.scope_entries == 0
+    assert plugin.executor.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_screenshot_without_data_dir_rejects_before_io(firecrawl_scrape_tool):
+    """screenshot 在数据目录未注入时同样在付费请求前拒绝。"""
+    plugin = _FakePlugin({})
+    tool = firecrawl_scrape_tool(plugin=plugin, data_dir=None)
+    context = SimpleNamespace(context=SimpleNamespace(event=object()))
+    result = json.loads(
+        await tool.call(context, url="https://example.com", format="screenshot")
+    )
+    assert result["ok"] is False
+    assert result["category"] == "usage"
+    assert plugin.scope_entries == 0
+    assert plugin.executor.calls == 0

@@ -270,9 +270,15 @@ async def test_initialize_assembles_runtime_and_registers_tools(
         assert [tool.name for tool in context.added_tools] == [
             "firecrawl_search",
             "firecrawl_scrape",
+            "firecrawl_parse",
+            "firecrawl_agent",
             "firecrawl_site",
         ]
         assert all(tool.plugin is plugin for tool in context.added_tools)
+        scrape_tool = next(
+            tool for tool in context.added_tools if tool.name == "firecrawl_scrape"
+        )
+        assert scrape_tool.data_dir == tmp_path / "data"
         assert plugin.key_pool.key_count == 2
         assert plugin.key_pool._cooldown_seconds == 30
         assert plugin.client._base_url == "https://proxy.example.com"
@@ -285,6 +291,25 @@ async def test_initialize_assembles_runtime_and_registers_tools(
         assert plugin.executor._client is plugin.client
         assert plugin.executor._store is plugin.store
         assert plugin._semaphore._value == 3
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_no_key_still_registers_all_tools(main_sdk, monkeypatch, tmp_path):
+    monkeypatch.setattr(_StubStarTools, "data_dir", tmp_path / "data")
+    context = _StubContext()
+    plugin = _new_plugin(main_sdk.module, {"api_keys": []}, context)
+    await plugin.initialize()
+    try:
+        assert [tool.name for tool in context.added_tools] == [
+            "firecrawl_search",
+            "firecrawl_scrape",
+            "firecrawl_parse",
+            "firecrawl_agent",
+            "firecrawl_site",
+        ]
+        assert plugin.key_pool.key_count == 0
     finally:
         await plugin.terminate()
 

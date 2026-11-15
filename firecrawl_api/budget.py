@@ -9,8 +9,16 @@ from enum import Enum
 
 from .errors import ErrorCategory, FirecrawlError
 
-# 当前工具只开放这些 format；json、question 每页加价，summary 不加价。
-_PAGE_FORMATS = ("markdown", "summary", "links", "html", "question", "json")
+# 当前工具只开放这些 format；json、question 每页加价，summary、screenshot 不加价。
+_PAGE_FORMATS = (
+    "markdown",
+    "summary",
+    "links",
+    "html",
+    "question",
+    "json",
+    "screenshot",
+)
 _SURCHARGE_FORMATS = ("question", "json")
 _SITE_KINDS = ("map", "crawl", "batch")
 
@@ -246,6 +254,31 @@ def estimate_site(
     _require_count(page_count, "page_count", minimum=1)
     per_page = estimate_page(output_format, pdf_max_pages, check_prompt_injection)
     return page_count * per_page
+
+
+def estimate_parse(
+    *,
+    is_pdf: bool,
+    pdf_max_pages: int = 20,
+    check_prompt_injection: bool = False,
+) -> int:
+    """parse 单文件费用上界：基础 1 + 注入检测，仅 PDF 另加页数上限。"""
+    if not isinstance(is_pdf, bool):
+        raise ValueError(f"is_pdf 必须是布尔值，收到 {is_pdf!r}")
+    _require_count(
+        pdf_max_pages,
+        "pdf_max_pages",
+        minimum=_PDF_MAX_PAGES_LIMITS[0],
+        maximum=_PDF_MAX_PAGES_LIMITS[1],
+    )
+    if not isinstance(check_prompt_injection, bool):
+        raise ValueError("check_prompt_injection 必须是布尔值")
+    cost = _BASE_PAGE_COST
+    if check_prompt_injection:
+        cost += _INJECTION_SURCHARGE
+    if is_pdf:
+        cost += pdf_max_pages * _PDF_PAGE_COST
+    return cost
 
 
 def utc_day(now: datetime | None = None) -> str:

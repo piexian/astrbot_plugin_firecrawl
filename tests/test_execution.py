@@ -1633,3 +1633,334 @@ async def test_cancel_terminal_response_never_settles(tmp_path):
     assert record.accounted_credits == 0.0
     snapshot = await store.usage()
     assert snapshot.used == 0.0
+
+
+PARSE_URL = "https://api.firecrawl.dev/v2/parse"
+PARSE_OPTIONS = {"formats": ["markdown"], "parsers": [{"type": "pdf", "maxPages": 20}]}
+PARSE_CONTENT = b"%PDF-1.4\n" + bytes(range(256))
+
+
+def canonical_options(options: dict) -> str:
+    """按执行器约定复算 options 规范 JSON 字符串。"""
+    return json.dumps(
+        options,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
+def parse_fingerprint(filename: str, content: bytes, options: dict) -> str:
+    """按执行器约定复算 parse 指纹：仅 filename、内容完整 SHA-256 与 options。"""
+    return canonical_fingerprint(
+        "parse",
+        "/parse",
+        {
+            "filename": filename,
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "options": options,
+        },
+    )
+
+
+def multipart_fields(request: httpx.Request) -> list[tuple[dict[str, str], bytes]]:
+    """按请求头 boundary 解析 multipart 请求体为 (字段头, 字段数据) 列表。"""
+    content_type = request.headers["content-type"]
+    assert content_type.startswith("multipart/form-data; boundary=")
+    boundary = b"--" + content_type.split("boundary=", 1)[1].encode()
+    fields = []
+    for segment in request.content.split(boundary)[1:]:
+        if segment.startswith(b"--"):
+            continue
+        header_block, _, data = segment.lstrip(b"\r\n").partition(b"\r\n\r\n")
+        assert data.endswith(b"\r\n")
+        headers = {}
+        for line in header_block.split(b"\r\n"):
+            name, _, value = line.partition(b":")
+            headers[name.decode().strip().lower()] = value.decode().strip()
+        fields.append((headers, data[:-2]))
+    return fields
+
+
+def run_parse(executor: BudgetedExecutor, **overrides):
+    """以固定样例文件调用 execute_parse，允许按字段覆盖。"""
+    params = {
+        "filename": "doc.pdf",
+        "content": PARSE_CONTENT,
+        "options": PARSE_OPTIONS,
+        "estimate": 5,
+    }
+    params.update(overrides)
+    return executor.execute_parse(**params)
+
+
+@pytest.mark.asyncio
+async def test_parse_posts_multipart_options_file_and_settles(tmp_path):
+    body = {
+        "success": True,
+        "data": {"markdown": "# hi", "metadata": {"creditsUsed": 2}},
+    }
+    executor, store, requests = await make_executor(
+        tmp_path, [httpx.Response(200, json=body)]
+    )
+    response = await run_parse(executor)
+    assert response.status_code == 200
+    assert response.json() == body
+    request = requests[0]
+    assert str(request.url) == PARSE_URL
+    assert request.method == "POST"
+    assert request.headers["authorization"] == f"Bearer {K1}"
+    fields = multipart_fields(request)
+    assert len(fields) == 2
+    assert fields[0][0] == {"content-disposition": 'form-data; name="options"'}
+    assert fields[0][1] == canonical_options(PARSE_OPTIONS).encode("utf-8")
+    assert fields[1][0] == {
+        "content-disposition": 'form-data; name="file"; filename="doc.pdf"',
+        "content-type": "application/pdf",
+    }
+    assert fields[1][1] == PARSE_CONTENT
+    _, state, key_ref, actual, accounted, fingerprint = rows(tmp_path / "budget.db")[0]
+    assert state == "settled"
+    assert key_ref == key_reference(K1)
+    assert actual == accounted == 2.0
+    assert fingerprint == parse_fingerprint("doc.pdf", PARSE_CONTENT, PARSE_OPTIONS)
+    assert used(tmp_path / "budget.db") == 2.0
+    snapshot = await store.usage()
+    assert snapshot.active_reserved == 0.0
+
+
+@pytest.mark.asyncio
+async def test_parse_top_level_credits_win_over_metadata(tmp_path):
+    body = {
+        "success": True,
+        "creditsUsed": 3,
+        "data": {"metadata": {"creditsUsed": 9}},
+    }
+    executor, _, requests = await make_executor(
+        tmp_path, [httpx.Response(200, json=body)]
+    )
+    response = await run_parse(executor)
+    assert response.status_code == 200
+    assert len(requests) == 1
+    _, state, _, actual, accounted, _ = rows(tmp_path / "budget.db")[0]
+    assert state == "settled"
+    assert actual == accounted == 3.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "estimate", "expected"),
+    [
+        ({"success": True, "creditsUsed": 0}, 5, 0.0),
+        ({"success": True, "creditsUsed": 0.5}, 5, 0.5),
+        ({"success": True, "creditsUsed": 25}, 5, 25.0),
+        ({"success": True, "data": {"metadata": {"creditsUsed": 2}}}, 5, 2.0),
+        ({"success": True, "data": {"markdown": "# hi"}}, 7, 7.0),
+        ({"success": True, "data": {}}, 7, 7.0),
+        ({"success": True, "data": {"metadata": None}}, 7, 7.0),
+        ({"success": True, "data": {"metadata": {"numPages": 3}}}, 7, 7.0),
+    ],
+    ids=[
+        "top-zero",
+        "top-decimal",
+        "top-over-estimate",
+        "metadata",
+        "default-no-metadata",
+        "default-empty-data",
+        "default-null-metadata",
+        "default-metadata-no-credits",
+    ],
+)
+async def test_parse_credits_sources_and_values(tmp_path, body, estimate, expected):
+    executor, _, requests = await make_executor(
+        tmp_path, [httpx.Response(200, json=body)]
+    )
+    response = await run_parse(executor, estimate=estimate)
+    assert response.status_code == 200
+    assert len(requests) == 1
+    _, state, _, actual, accounted, _ = rows(tmp_path / "budget.db")[0]
+    assert state == "settled"
+    assert actual == accounted == expected
+    assert used(tmp_path / "budget.db") == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"success": true, "creditsUsed": null}',
+        b'{"success": true, "creditsUsed": true}',
+        b'{"success": true, "creditsUsed": -1}',
+        b'{"success": true, "creditsUsed": "3"}',
+        b'{"success": true, "creditsUsed": NaN}',
+        b'{"success": true, "creditsUsed": Infinity}',
+        b'{"success": true, "creditsUsed": ' + str(10**400).encode() + b"}",
+        b"[1, 2]",
+        b'{"success": true}',
+        b'{"success": true, "data": [1]}',
+        b'{"success": true, "data": {"metadata": "x"}}',
+        b'{"success": true, "data": {"metadata": {"creditsUsed": null}}}',
+        b'{"success": true, "data": {"metadata": {"creditsUsed": -2}}}',
+    ],
+    ids=[
+        "null",
+        "bool",
+        "negative",
+        "string",
+        "nan",
+        "inf",
+        "oversized",
+        "non-object",
+        "missing-data",
+        "data-list",
+        "metadata-string",
+        "metadata-null-credits",
+        "metadata-negative",
+    ],
+)
+async def test_parse_bad_credits_or_shape_stays_indeterminate(tmp_path, raw):
+    executor, _, requests = await make_executor(
+        tmp_path,
+        [
+            httpx.Response(
+                200, content=raw, headers={"content-type": "application/json"}
+            )
+        ],
+    )
+    with pytest.raises(PendingRequestError) as excinfo:
+        await run_parse(executor)
+    assert len(requests) == 1
+    assert excinfo.value.reservation_id
+    assert excinfo.value.task_handle is None
+    assert "请勿重发" in str(excinfo.value)
+    assert "PDF" not in str(excinfo.value)
+    _, state, _, actual, accounted, _ = rows(tmp_path / "budget.db")[0]
+    assert state == "indeterminate"
+    assert actual is None
+    assert accounted == 0.0
+    assert used(tmp_path / "budget.db") == 0.0
+
+
+@pytest.mark.asyncio
+async def test_parse_fingerprint_excludes_file_body(tmp_path):
+    executor, _, _ = await make_executor(
+        tmp_path,
+        [
+            httpx.Response(200, json={"success": True, "creditsUsed": 1}),
+            httpx.Response(200, json={"success": True, "creditsUsed": 1}),
+        ],
+    )
+    await run_parse(executor)
+    await run_parse(executor, content=b"%PDF-other-bytes")
+    table = rows(tmp_path / "budget.db")
+    assert table[0][5] == parse_fingerprint("doc.pdf", PARSE_CONTENT, PARSE_OPTIONS)
+    assert table[1][5] == parse_fingerprint(
+        "doc.pdf", b"%PDF-other-bytes", PARSE_OPTIONS
+    )
+    assert table[0][5] != table[1][5]
+    assert table[0][5] != parse_fingerprint("other.pdf", PARSE_CONTENT, PARSE_OPTIONS)
+    assert table[0][5] != parse_fingerprint(
+        "doc.pdf", PARSE_CONTENT, {"formats": ["markdown"]}
+    )
+    db_bytes = (tmp_path / "budget.db").read_bytes()
+    assert PARSE_CONTENT not in db_bytes
+    assert b"%PDF-other-bytes" not in db_bytes
+
+
+@pytest.mark.asyncio
+async def test_parse_rotation_keeps_single_reservation_and_final_key(tmp_path):
+    responses = [
+        httpx.Response(401, json={"success": False, "error": "Unauthorized"}),
+        httpx.Response(402, json={"success": False, "error": "quota"}),
+        httpx.Response(200, json={"success": True, "creditsUsed": 2}),
+    ]
+    executor, _, requests = await make_executor(tmp_path, responses, keys=(K1, K2, K3))
+    response = await run_parse(executor)
+    assert response.status_code == 200
+    assert len(requests) == 3
+    assert [r.headers["authorization"] for r in requests] == [
+        f"Bearer {K1}",
+        f"Bearer {K2}",
+        f"Bearer {K3}",
+    ]
+    table = rows(tmp_path / "budget.db")
+    assert len(table) == 1
+    _, state, key_ref, actual, accounted, _ = table[0]
+    assert state == "settled"
+    assert key_ref == key_reference(K3)
+    assert actual == accounted == 2.0
+
+
+@pytest.mark.asyncio
+async def test_parse_submitting_persistence_failure_zero_network(tmp_path):
+    executor, _, requests = await make_executor(
+        tmp_path, [httpx.Response(200, json={"success": True, "creditsUsed": 1})]
+    )
+    add_trigger(tmp_path / "budget.db", BLOCK_UPDATE_TRIGGER)
+    with pytest.raises(sqlite3.IntegrityError):
+        await run_parse(executor)
+    assert requests == []
+    _, state, _, actual, accounted, _ = rows(tmp_path / "budget.db")[0]
+    assert state == "reserved"
+    assert actual is None
+    assert accounted == 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        httpx.ReadTimeout("timed out"),
+        httpx.ConnectError("network down"),
+        httpx.Response(500, json={"success": False, "error": "boom"}),
+        httpx.Response(302),
+    ],
+    ids=["timeout", "connect-error", "server-error", "redirect"],
+)
+async def test_parse_unclassified_failure_never_resends(tmp_path, outcome):
+    executor, _, requests = await make_executor(tmp_path, [outcome])
+    with pytest.raises(PendingRequestError) as excinfo:
+        await run_parse(executor)
+    assert len(requests) == 1
+    assert isinstance(excinfo.value.__cause__, FirecrawlError)
+    _, state, _, actual, accounted, _ = rows(tmp_path / "budget.db")[0]
+    assert state == "indeterminate"
+    assert actual is None
+    assert accounted == 0.0
+
+
+@pytest.mark.asyncio
+async def test_parse_final_rejection_releases_reservation(tmp_path):
+    executor, _, requests = await make_executor(
+        tmp_path, [httpx.Response(402, json={"success": False, "error": "quota"})]
+    )
+    with pytest.raises(FirecrawlError) as excinfo:
+        await run_parse(executor)
+    assert excinfo.value.rotate_key is True
+    assert len(requests) == 1
+    _, state, _, actual, accounted, _ = rows(tmp_path / "budget.db")[0]
+    assert state == "released"
+    assert actual == accounted == 0.0
+    assert used(tmp_path / "budget.db") == 0.0
+
+
+@pytest.mark.asyncio
+async def test_parse_then_client_close_releases_owned_client(tmp_path):
+    transport, requests = make_transport(
+        [httpx.Response(200, json={"success": True, "creditsUsed": 1})]
+    )
+    client = FirecrawlClient(KeyPool([K1]), transport=transport)
+    store = SQLiteStore(
+        tmp_path / "budget.db", policy=BudgetPolicy(), clock=fixed_clock
+    )
+    await store.initialize()
+    executor = BudgetedExecutor(client, store)
+    response = await run_parse(executor)
+    assert response.status_code == 200
+    assert len(requests) == 1
+    await client.aclose()
+    with pytest.raises(RuntimeError):
+        await client.request("POST", "/parse")
+    snapshot = await store.usage()
+    assert snapshot.used == 1.0
